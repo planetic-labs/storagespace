@@ -27,6 +27,8 @@ class Storage(Protocol):
     def move(self, source: str, target: str) -> dict: ...
     def trash(self, path: str, trash_id: str) -> None: ...
     def trash_exists(self, trash_id: str) -> bool: ...
+    def trash_is_dir(self, trash_id: str) -> bool: ...
+    def list_trashed(self, trash_id: str, path: str = "") -> list[dict]: ...
     def restore(self, trash_id: str, path: str) -> None: ...
     def purge(self, trash_id: str) -> None: ...
     def create_upload(self, upload_id: str, path: str) -> None: ...
@@ -191,6 +193,27 @@ class MountedStorage:
 
     def trash_exists(self, trash_id: str) -> bool:
         return self._trash_path(trash_id).exists()
+
+    def trash_is_dir(self, trash_id: str) -> bool:
+        return self._trash_path(trash_id).is_dir()
+
+    def list_trashed(self, trash_id: str, path: str = "") -> list[dict]:
+        root = self._trash_path(trash_id)
+        if not root.is_dir():
+            raise HTTPException(404, "Удалённая папка не найдена")
+        current = root
+        for part in self._parts(path, allow_root=True):
+            current = current / part
+            if current.is_symlink():
+                raise HTTPException(400, "Символьные ссылки не поддерживаются")
+        if not current.is_dir():
+            raise HTTPException(404, "Папка не найдена")
+        entries = []
+        for item in current.iterdir():
+            if item.name.startswith(".") or item.is_symlink():
+                continue
+            entries.append({**self._info(item), "path": item.relative_to(root).as_posix()})
+        return sorted(entries, key=lambda entry: (not entry["directory"], entry["name"].casefold()))
 
     def restore(self, trash_id: str, path: str) -> None:
         source, target = self._trash_path(trash_id), self._path(path)

@@ -4,6 +4,8 @@ services:
     build: ./backend
     restart: unless-stopped
     user: "1000:1000"
+    env_file:
+      - .env.auth
     environment:
       APP_DATA: /data
       STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"},{"id":"prosvetlenie","name":"Просветление","path":"/storage/prosvetlenie","mode":"sshfs"}]'
