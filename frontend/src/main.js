@@ -36,9 +36,14 @@ const suggestedFilename = name => {
 }
 
 function init() {
-  $('#serviceVersion').textContent=__APP_VERSION__
   let storages = [], files = []
-  let uploadBusy = false
+  const uploadQueue = []
+  let uploadWorkerRunning = false, uploadPanelCollapsed = false, nextUploadId = 0
+  const uploadPanel=document.createElement('aside')
+  uploadPanel.id='uploadPanel'
+  uploadPanel.className='upload-panel'
+  uploadPanel.setAttribute('aria-label','Загрузки')
+  document.body.append(uploadPanel)
   const fileDragHint=document.createElement('div')
   fileDragHint.className='file-drag-hint'
   fileDragHint.innerHTML=`${icon('upload',36)}<strong>Отпустите файлы для загрузки</strong><span>В текущее хранилище или в папку под курсором</span>`
@@ -52,6 +57,22 @@ function init() {
   const fileUrl = (f, kind='preview') => '/api/' + kind + '?' + params({storage:f.storage,path:f.path})
   const asFile = (entry, index) => ({ ...entry, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
   function showToast(message) { const target=$('#toast'); target.textContent=message; target.classList.add('open'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>target.classList.remove('open'),3500) }
+  const uploadKey = task => 'storagespace-upload:'+task.storage+':'+task.path+':'+task.file.size+':'+task.file.lastModified
+  function renderUploadPanel() {
+    if(!uploadQueue.length){uploadPanel.className='upload-panel';uploadPanel.innerHTML='';return}
+    const pending=uploadQueue.filter(task=>task.status==='queued'||task.status==='uploading').length
+    const errors=uploadQueue.filter(task=>task.status==='error').length
+    const count=pending||errors||uploadQueue.length
+    const title=pending?`Загружается ${count} ${count===1?'файл':count<5?'файла':'файлов'}`:errors?`Ошибки загрузки · ${errors}`:'Загрузка завершена'
+    uploadPanel.className='upload-panel open'+(uploadPanelCollapsed?' collapsed':'')
+    uploadPanel.innerHTML=`<div class="upload-panel-head"><strong>${title}</strong><div class="upload-panel-controls"><button data-upload-toggle aria-label="${uploadPanelCollapsed?'Развернуть загрузки':'Свернуть загрузки'}">${uploadPanelCollapsed?'⌃':'⌄'}</button><button data-upload-dismiss aria-label="Скрыть панель загрузок">×</button></div></div><div class="upload-panel-body">${uploadQueue.map(task=>{
+      const percent=task.file.size?Math.min(100,Math.round(task.offset/task.file.size*100)):task.status==='done'?100:0
+      const circumference=62.83
+      const ring=`<svg class="upload-ring" width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle class="upload-ring-track" cx="13" cy="13" r="10"/><circle class="upload-ring-value" cx="13" cy="13" r="10" stroke-dasharray="${circumference}" stroke-dashoffset="${(circumference*(1-percent/100)).toFixed(2)}"/></svg>`
+      const status=task.status==='done'?'<span class="upload-done" role="img" aria-label="Загружено">✓</span>':task.status==='error'?`<button class="upload-retry" data-upload-retry="${task.id}" aria-label="Повторить загрузку ${esc(task.file.name)}" title="${esc(task.error||'Ошибка загрузки')}">↻</button>`:task.cancelRequested?'<span class="upload-cancelling" aria-label="Отменяется">×</span>':task.phase==='finishing'?ring:`<button class="upload-progress" data-upload-cancel="${task.id}" aria-label="Отменить загрузку ${esc(task.file.name)}, ${percent}%" title="Отменить загрузку">${ring}<span class="upload-progress-cross">×</span></button>`
+      return `<div class="upload-item ${task.status}"><span class="upload-file-icon" aria-hidden="true">${icon('file',17)}</span><span class="upload-item-name" title="${esc(task.file.name)}">${esc(task.file.name)}</span>${status}</div>`
+    }).join('')}</div>`
+  }
   function closeModal() { $('#overlay').classList.remove('open'); $('#modal').innerHTML='' }
   function modal(title, content, compact=false) { $('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
   function closeMenu() { $('#context').classList.remove('open') }
@@ -65,8 +86,7 @@ function init() {
     const active=currentStorage()
     $('#sideStorages').innerHTML=storages.map(s=>`<button class="storage ${s.id===state.storage&&state.view==='all'?'active':''}" data-storage="${esc(s.id)}" aria-label="${esc(s.name)}: ${s.online?'свободно '+capacity(s.free)+' из '+capacity(s.total):'недоступно'}">${icon('drive',18)}<span class="storage-info"><span class="storage-name">${esc(s.name)}</span><span class="storage-sub">${s.online?'Свободно '+capacity(s.free)+' из '+capacity(s.total):'Хранилище недоступно'}</span><span class="storage-meter"><i style="width:${s.online&&s.total?Math.round((s.total-s.free)/s.total*100):0}%"></i></span></span></button>`).join('')
     document.querySelectorAll('.nav').forEach(button=>button.classList.toggle('active',button.dataset.nav===state.view))
-    $('#eyebrow').textContent=state.view==='trash'?'УДАЛЁННЫЕ ФАЙЛЫ':state.view==='all'?'РАБОЧЕЕ ПРОСТРАНСТВО':'БЫСТРЫЙ ДОСТУП'
-    $('#pageTitle').textContent=state.view==='trash'?'Корзина':state.view==='recent'?'Недавние':state.view==='favorites'?'Избранное':state.folder?state.folder.split('/').at(-1):'Все файлы'
+    $('#pageTitle').textContent=state.view==='trash'?'Корзина':state.view==='recent'?'Недавние':state.view==='favorites'?'Избранное':'Все файлы'
     $('#search').placeholder=state.view==='trash'?'Поиск в корзине':state.view==='recent'?'Поиск в недавних':state.view==='favorites'?'Поиск в избранном':'Поиск в текущей папке'
     $('#filesHead').style.display=state.view==='all'&&!!state.folder?'block':'none'
     const crumbs=[{name:active?.name||'Хранилище',path:''}]
@@ -122,27 +142,83 @@ function init() {
   }
   function uploadModal() {
     if(state.view!=='all')return showToast('Сначала откройте хранилище')
-    modal('Загрузить файлы',`<div class="dropzone" id="dropzone">${icon('upload',32)}<strong>Перетащите файлы сюда</strong><p>или выберите их на устройстве</p><button class="soft-button" id="chooseFiles">Выбрать файлы</button></div><p class="modal-note" id="uploadStatus">Большие файлы загружаются частями. После обрыва выберите тот же файл для продолжения.</p>`,true)
+    modal('Загрузить файлы',`<div class="dropzone" id="dropzone">${icon('upload',32)}<strong>Перетащите файлы сюда</strong><p>или выберите их на устройстве</p><button class="soft-button" id="chooseFiles">Выбрать файлы</button></div><p class="modal-note">После выбора загрузка продолжится в фоне. Новые файлы добавятся в очередь.</p>`,true)
     $('#chooseFiles').onclick=()=>$('#fileInput').click();const zone=$('#dropzone');zone.ondragover=e=>{e.preventDefault();zone.classList.add('drag-over')};zone.ondragleave=()=>zone.classList.remove('drag-over');zone.ondrop=e=>{e.preventDefault();addFiles(e.dataTransfer.files)}
   }
-  async function uploadOne(file,storage,folder) {
-    const path=[folder,file.name].filter(Boolean).join('/'),key='storagespace-upload:'+storage+':'+path+':'+file.size+':'+file.lastModified
+  async function discardUpload(task) {
+    const key=uploadKey(task), sessionId=task.sessionId||localStorage.getItem(key)
+    if(sessionId){try{await api('/uploads/'+sessionId,{method:'DELETE'})}catch(error){if(error.status!==404)throw error}}
+    localStorage.removeItem(key)
+    const index=uploadQueue.indexOf(task)
+    if(index>=0)uploadQueue.splice(index,1)
+    renderUploadPanel()
+  }
+  function confirmCancelUpload(task) {
+    if(!task||task.status==='done'||task.phase==='finishing'||task.cancelRequested)return
+    modal('Прервать загрузку?',`<p class="modal-note">Файл «${esc(task.file.name)}» перестанет загружаться. Уже переданная часть будет удалена с сервера.</p><div class="modal-footer"><button class="soft-button" id="keepUpload">Продолжить загрузку</button><button class="primary-button" id="confirmCancelUpload">Прервать загрузку</button></div>`,true)
+    $('#keepUpload').onclick=closeModal
+    $('#confirmCancelUpload').onclick=()=>{
+      closeModal()
+      if(task.status==='done'||task.phase==='finishing'){showToast('Файл уже загружен');return}
+      void cancelUpload(task)
+    }
+    $('#keepUpload').focus()
+  }
+  async function cancelUpload(task) {
+    if(!task||task.status==='done'||task.phase==='finishing'||task.cancelRequested)return
+    task.cancelRequested=true
+    task.controller?.abort()
+    renderUploadPanel()
+    if(task.status!=='uploading'){
+      try{await discardUpload(task)}catch(error){task.status='error';task.error=error.message;task.cancelRequested=false;renderUploadPanel()}
+    }
+  }
+  async function uploadOne(task) {
+    const {file,storage,path}=task, key=uploadKey(task)
     let session
     try {const saved=localStorage.getItem(key);if(saved){session=await api('/uploads/'+saved);if(session.storage!==storage||session.path!==path||session.size!==file.size)session=null}}catch{localStorage.removeItem(key)}
+    if(task.cancelRequested)throw new Error('Загрузка отменена')
     if(!session){session=await api('/uploads',jsonBody({storage,path,size:file.size}));localStorage.setItem(key,session.id)}
+    task.sessionId=session.id
+    if(task.cancelRequested)throw new Error('Загрузка отменена')
     let offset=session.offset
+    task.offset=offset;renderUploadPanel()
     while(offset<file.size){
-      const status=$('#uploadStatus');if(status)status.textContent=`${file.name}: ${Math.round(offset/file.size*100)}% · ${size(offset)} из ${size(file.size)}`
-      try {const result=await api('/uploads/'+session.id,{method:'PATCH',headers:{'X-Upload-Offset':String(offset),'Content-Type':'application/octet-stream'},body:file.slice(offset,Math.min(offset+8*1024*1024,file.size))});offset=result.offset}
-      catch(error){const current=await api('/uploads/'+session.id);if(current.offset===offset)throw error;offset=current.offset}
+      if(task.cancelRequested)throw new Error('Загрузка отменена')
+      const controller=new AbortController()
+      task.controller=controller
+      try {const result=await api('/uploads/'+session.id,{method:'PATCH',headers:{'X-Upload-Offset':String(offset),'Content-Type':'application/octet-stream'},body:file.slice(offset,Math.min(offset+8*1024*1024,file.size)),signal:controller.signal});offset=result.offset}
+      catch(error){if(task.cancelRequested)throw error;const current=await api('/uploads/'+session.id);if(current.offset===offset)throw error;offset=current.offset}
+      finally{task.controller=null}
+      task.offset=offset;renderUploadPanel()
     }
+    if(task.cancelRequested)throw new Error('Загрузка отменена')
+    task.phase='finishing';renderUploadPanel()
     await api('/uploads/'+session.id+'/complete',{method:'POST'});localStorage.removeItem(key)
-    const status=$('#uploadStatus');if(status)status.textContent=`${file.name}: 100% · загрузка завершена`
   }
-  async function addFiles(list, destination=state.folder) {
+  async function drainUploadQueue() {
+    if(uploadWorkerRunning)return
+    uploadWorkerRunning=true
+    try {
+      while(true){
+        const task=uploadQueue.find(item=>item.status==='queued'&&!item.cancelRequested)
+        if(!task)break
+        task.status='uploading';renderUploadPanel()
+        try {
+          await uploadOne(task)
+          task.status='done';task.offset=task.file.size;renderUploadPanel()
+          if(state.view==='all'&&state.storage===task.storage&&state.folder===task.folder)void load()
+          void refreshStorages().catch(()=>{})
+        } catch(error) {
+          if(task.cancelRequested){try{await discardUpload(task)}catch(cleanupError){task.status='error';task.error=cleanupError.message;task.cancelRequested=false;renderUploadPanel()}}
+          else{task.status='error';task.error=error.message;renderUploadPanel()}
+        }
+      }
+    } finally {uploadWorkerRunning=false;renderUploadPanel()}
+  }
+  function addFiles(list, destination=state.folder) {
     const selected=[...list]
     if(!selected.length)return
-    if(uploadBusy)return showToast('Загрузка уже идёт')
     if(state.view!=='all')return showToast('Сначала откройте хранилище')
     const storage=state.storage
     if(!storage)return showToast('Выберите хранилище')
@@ -154,19 +230,26 @@ function init() {
       $('#filenameUnderstood').onclick=closeModal
       return
     }
-    uploadBusy=true
-    if(!$('#overlay').classList.contains('open'))modal('Загрузка файлов',`<p class="modal-note" id="uploadStatus">Подготовка загрузки…</p>`,true)
-    try {
-      for(const file of selected)await uploadOne(file,storage,destination)
-      await load();await refreshStorages()
-      showToast('Файлы загружены: '+selected.length)
-      closeModal()
-    } catch(e) {
-      const status=$('#uploadStatus');if(status)status.textContent=`Ошибка: ${e.message}. Повторно выберите тот же файл для продолжения.`
-      showToast(e.message)
-    } finally {uploadBusy=false}
+    let added=0
+    for(const file of selected){
+      const path=[destination,file.name].filter(Boolean).join('/')
+      if(uploadQueue.some(task=>task.storage===storage&&task.path===path&&['queued','uploading'].includes(task.status)))continue
+      uploadQueue.push({id:++nextUploadId,file,storage,folder:destination,path,status:'queued',offset:0,error:''})
+      added++
+    }
+    if($('#dropzone'))closeModal()
+    uploadPanelCollapsed=false
+    renderUploadPanel()
+    if(added){showToast(added===1?'Файл добавлен в очередь':`Добавлено файлов в очередь: ${added}`);void drainUploadQueue()}
+    else showToast('Эти файлы уже находятся в очереди')
   }
   document.addEventListener('click',e=>{
+    if(e.target.closest('[data-upload-toggle]')){uploadPanelCollapsed=!uploadPanelCollapsed;renderUploadPanel();return}
+    if(e.target.closest('[data-upload-dismiss]')){for(let i=uploadQueue.length-1;i>=0;i--)if(uploadQueue[i].status==='done')uploadQueue.splice(i,1);uploadPanelCollapsed=true;renderUploadPanel();return}
+    const cancel=e.target.closest('[data-upload-cancel]')
+    if(cancel){confirmCancelUpload(uploadQueue.find(item=>item.id===Number(cancel.dataset.uploadCancel)));return}
+    const retry=e.target.closest('[data-upload-retry]')
+    if(retry){const task=uploadQueue.find(item=>item.id===Number(retry.dataset.uploadRetry));if(task?.status==='error'){task.status='queued';task.error='';task.cancelRequested=false;task.phase='';renderUploadPanel();void drainUploadQueue()}return}
     const storage=e.target.closest('[data-storage]');if(storage)return selectStorage(storage.dataset.storage)
     const nav=e.target.closest('[data-nav]');if(nav)return selectView(nav.dataset.nav)
     const crumb=e.target.closest('[data-crumb]');if(crumb){state.folder=crumb.dataset.crumb;state.selected=null;return load()}
@@ -189,6 +272,7 @@ function init() {
   $('#menuToggle').onclick=()=>$('#sidebar').classList.toggle('open')
   $('#overlay').onclick=e=>{if(e.target===$('#overlay'))closeModal()}
   document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();closeMenu();$('#sidebar').classList.remove('open')}})
+  window.addEventListener('beforeunload',e=>{if(uploadQueue.some(task=>task.status==='queued'||task.status==='uploading')){e.preventDefault();e.returnValue=''}})
   window.addEventListener('dragover',e=>{
     if(!externalFiles(e))return
     e.preventDefault()
