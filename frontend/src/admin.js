@@ -12,7 +12,7 @@ export async function openAdmin() {
   panel.className='admin-screen'
   panel.innerHTML='<div class="admin-shell"><div class="admin-loading">Загрузка настроек…</div></div>'
   document.body.append(panel)
-  let data, tab='access', editingRole=null, editingGroup=null
+  let data, tab='access', editingRole=null, editingGroup=null, auditPage=null
   const shell=panel.querySelector('.admin-shell')
   const close=()=>panel.remove()
   const nameOf=(type,id)=>type==='role'?data.roles.find(x=>x.id===id)?.name:type==='group'?data.groups.find(x=>x.id===id)?.name:data.users.find(x=>x.id===id)?.email
@@ -41,15 +41,22 @@ export async function openAdmin() {
       <div class="admin-list">${data.grants.map(grant=>`<div class="admin-list-row"><div><strong>${esc(nameOf(grant.subject_type,grant.subject_id)||'Удалённый получатель')}</strong><small>${esc(data.storages.find(s=>s.id===grant.storage)?.name||grant.storage)}${grant.path?' / '+esc(grant.path):' · целиком'} · ${grant.level===2?'Изменение':'Просмотр'}</small></div><button class="admin-text-button danger" data-delete-grant="${grant.id}">Убрать доступ</button></div>`).join('')||'<p class="admin-empty">Разрешений пока нет.</p>'}</div>
       <form class="admin-form" id="grantForm"><h3>Выдать доступ</h3><label class="admin-field">Кому<select name="subject">${options(subjects)}</select></label><label class="admin-field">Хранилище<select name="storage">${options(data.storages)}</select></label>${field('Путь к папке (пусто — всё хранилище)','path','','placeholder="Например, Проекты/2026"')}<label class="admin-field">Уровень<select name="level"><option value="1">Просмотр и скачивание</option><option value="2">Изменение файлов</option></select></label><button class="primary-button">Выдать доступ</button></form>`
   }
+  function renderAudit(){
+    const names={mkdir:'Новая папка',upload:'Загрузка',upload_cancel:'Отмена загрузки',move:'Перемещение',trash:'В корзину',restore:'Восстановление',delete_forever:'Удаление навсегда'}
+    return `<div class="admin-section-head"><div><h2>Журнал изменений файлов</h2><p>Записываются завершённые операции изменения. Просмотры и скачивания сюда не входят.</p></div></div>
+      <div class="admin-list">${auditPage?.items?.map(item=>`<div class="admin-list-row"><div><strong>${esc(names[item.operation]||item.operation)} · ${esc(item.path)}</strong><small>${esc(new Date(item.at).toLocaleString('ru-RU'))} · ${esc(item.user_email||'Пользователь не указан')} · ${esc(data.storages.find(s=>s.id===item.storage)?.name||item.storage)}${item.target?' → '+esc(item.target):''}</small></div></div>`).join('')||'<p class="admin-empty">Записей пока нет.</p>'}</div>
+      ${auditPage?.next_before?'<button class="soft-button admin-more" data-more-audit>Показать ещё</button>':''}`
+  }
   function render(){
     data.self_id=data.self_id||window.storageSpaceUser?.id
-    shell.innerHTML=`<header class="admin-header"><div><span>Storage Space</span><h1>Администрирование</h1></div><button class="admin-close" aria-label="Закрыть администрирование">×</button></header><nav class="admin-tabs">${[['access','Доступ'],['users','Пользователи'],['roles','Роли'],['groups','Группы']].map(([key,label])=>`<button data-admin-tab="${key}" class="${tab===key?'active':''}">${label}</button>`).join('')}</nav><div class="admin-content"><p class="admin-message" hidden></p>${tab==='roles'?renderRoles():tab==='groups'?renderGroups():tab==='users'?renderUsers():renderAccess()}</div>`
+    shell.innerHTML=`<header class="admin-header"><div><span>Storage Space</span><h1>Администрирование</h1></div><button class="admin-close" aria-label="Закрыть администрирование">×</button></header><nav class="admin-tabs">${[['access','Доступ'],['users','Пользователи'],['roles','Роли'],['groups','Группы'],['audit','Журнал']].map(([key,label])=>`<button data-admin-tab="${key}" class="${tab===key?'active':''}">${label}</button>`).join('')}</nav><div class="admin-content"><p class="admin-message" hidden></p>${tab==='roles'?renderRoles():tab==='groups'?renderGroups():tab==='users'?renderUsers():tab==='audit'?renderAudit():renderAccess()}</div>`
   }
   panel.addEventListener('click',event=>{
     const target=event.target.closest('button')
     if(!target)return
     if(target.classList.contains('admin-close'))return close()
-    if(target.dataset.adminTab){tab=target.dataset.adminTab;editingRole=null;editingGroup=null;render();return}
+    if(target.dataset.adminTab){tab=target.dataset.adminTab;editingRole=null;editingGroup=null;if(tab==='audit'){request('/audit').then(page=>{auditPage=page;render()}).catch(message)}else render();return}
+    if(target.hasAttribute('data-more-audit')){request('/audit?before='+auditPage.next_before).then(page=>{auditPage={items:[...auditPage.items,...page.items],next_before:page.next_before};render()}).catch(message);return}
     if(target.dataset.editRole){editingRole=data.roles.find(x=>x.id===Number(target.dataset.editRole));render();return}
     if(target.dataset.editGroup){editingGroup=data.groups.find(x=>x.id===Number(target.dataset.editGroup));render();return}
     if(target.hasAttribute('data-cancel-edit')){editingRole=null;editingGroup=null;render();return}

@@ -61,6 +61,19 @@ def overview(request: Request):
             "storages": [{"id": key, "name": value.name} for key, value in storage_ids.items()]}
 
 
+@router.get("/audit")
+def audit_log(request: Request, before: int | None = None, limit: int = 50):
+    administrator(request)
+    if limit < 1 or limit > 100 or (before is not None and before < 1):
+        raise HTTPException(400, "Некорректная страница журнала")
+    with authz.connection() as db:
+        rows = [dict(row) for row in db.execute(
+            """SELECT id,at,operation,storage,path,target,user_id,user_email
+               FROM audit WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?""",
+            (before, before, limit + 1))]
+    return {"items": rows[:limit], "next_before": rows[limit - 1]["id"] if len(rows) > limit else None}
+
+
 @router.post("/roles")
 def create_role(body: RoleBody, request: Request):
     administrator(request)

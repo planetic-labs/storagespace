@@ -5,6 +5,11 @@ import os
 import shutil
 import stat
 import asyncio
+import json
+import subprocess
+import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Protocol
@@ -16,7 +21,7 @@ from fastapi.responses import FileResponse, Response
 class Storage(Protocol):
     id: str
     name: str
-    def status(self) -> dict: ...
+    def status(self, force: bool = False) -> dict: ...
     def list_dir(self, path: str, search: str = "") -> list[dict]: ...
     def info(self, path: str) -> dict: ...
     def exists(self, path: str) -> bool: ...
@@ -52,6 +57,10 @@ class MountedStorage:
             raise ValueError(f"Storage path must be absolute: {root}")
         self.id, self.name, self.root, self.mode = storage_id, name, Path(root), mode
         self._upload_locks: dict[str, asyncio.Lock] = {}
+        self._health_lock = threading.Lock()
+        self._health_at = 0.0
+        self._health = None
+        self._stalled_probe = None
 
     def _online(self) -> bool:
         if self.mode == "local":
@@ -65,13 +74,13 @@ class MountedStorage:
                         continue
                     mount, filesystem = line.split(" - ", 1)
                     if mount.split()[4] == str(self.root) and filesystem.split()[0] == "fuse.sshfs":
-                        return self.root.is_dir()
+                        return True
             return False
         except OSError:
             return False
 
     def _require_online(self) -> None:
-        if not self._online():
+        if not (self._online() if self.mode == "local" else self.status()["online"]):
             raise HTTPException(503, "Хранилище недоступно")
 
     @staticmethod
@@ -103,16 +112,49 @@ class MountedStorage:
                 "size": info.st_size,
                 "modified": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()}
 
-    def status(self) -> dict:
+    def status(self, force: bool = False) -> dict:
         online = self._online()
         free = total = None
         if online:
             try:
-                usage = shutil.disk_usage(self.root)
-                free, total = usage.free, usage.total
+                if self.mode == "sshfs":
+                    free, total = self._remote_usage(force)
+                    online = free is not None
+                else:
+                    usage = shutil.disk_usage(self.root)
+                    free, total = usage.free, usage.total
             except OSError:
                 online = False
         return {"id": self.id, "name": self.name, "online": online, "free": free, "total": total}
+
+    def _remote_usage(self, force=False):
+        # A disconnected FUSE mount can block statvfs indefinitely. Probe it
+        # in a child process, and never start a second probe while one is stuck.
+        with self._health_lock:
+            current = time.monotonic()
+            if not force and self._health is not None and current - self._health_at < 10:
+                return self._health
+            if self._stalled_probe is not None:
+                if self._stalled_probe.poll() is None:
+                    self._health = (None, None)
+                    self._health_at = current
+                    return self._health
+                self._stalled_probe.communicate()
+                self._stalled_probe = None
+            probe = subprocess.Popen(
+                [sys.executable, "-c", "import json,os,sys; s=os.statvfs(sys.argv[1]); print(json.dumps([s.f_bavail*s.f_frsize,s.f_blocks*s.f_frsize]))", str(self.root)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            try:
+                output, _ = probe.communicate(timeout=2)
+                values = json.loads(output) if probe.returncode == 0 else [None, None]
+                self._health = (values[0], values[1])
+            except (subprocess.TimeoutExpired, ValueError, IndexError, TypeError):
+                if probe.poll() is None:
+                    probe.kill()
+                    self._stalled_probe = probe
+                self._health = (None, None)
+            self._health_at = current
+            return self._health
 
     def list_dir(self, path: str, search: str = "") -> list[dict]:
         directory = self._path(path, allow_root=True)

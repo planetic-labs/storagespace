@@ -95,6 +95,9 @@ function init(user) {
   }
   function render() {
     const active=currentStorage()
+    const offline=state.view==='all'&&active&&!active.online
+    $('#newFolderHeading').disabled=!!offline||!state.storage
+    $('#uploadTop').disabled=!!offline||!state.storage
     $('#sideStorages').innerHTML=storages.map(s=>`<button class="storage ${s.id===state.storage&&state.view==='all'?'active':''}" data-storage="${esc(s.id)}" aria-label="${esc(s.name)}: ${s.online?'свободно '+capacity(s.free)+' из '+capacity(s.total):'недоступно'}">${icon('drive',18)}<span class="storage-info"><span class="storage-name">${esc(s.name)}</span><span class="storage-sub">${s.online?'Свободно '+capacity(s.free)+' из '+capacity(s.total):'Хранилище недоступно'}</span><span class="storage-meter"><i style="width:${s.online&&s.total?Math.round((s.total-s.free)/s.total*100):0}%"></i></span></span></button>`).join('')
     document.querySelectorAll('.nav').forEach(button=>button.classList.toggle('active',button.dataset.nav===state.view))
     $('#pageTitle').textContent=state.view==='trash'?'Корзина':state.view==='recent'?'Недавние':state.view==='favorites'?'Избранное':'Все файлы'
@@ -111,7 +114,7 @@ function init(user) {
       $('#breadcrumbs').innerHTML=crumbs.map((crumb,i)=>`${i?'<span>›</span>':''}<button class="crumb" data-crumb="${esc(crumb.path)}" title="Открыть папку или перетащить сюда файл">${esc(crumb.name)}</button>`).join('')
     }
     const visible=files.filter(f=>(f.name||'').toLocaleLowerCase('ru').includes(state.search.toLocaleLowerCase('ru')))
-    $('#rows').innerHTML=visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(f.type==='folder'?'folder':'file',21)}</span><span title="${esc(f.name)}">${esc(f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
+    $('#rows').innerHTML=offline?`<div class="empty storage-offline">${icon('drive',42)}<h3>Хранилище недоступно</h3><p>Проверяем подключение автоматически. После восстановления монтирования файлы появятся здесь.</p><button class="soft-button" id="retryStorage">Проверить сейчас</button></div>`:visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(f.type==='folder'?'folder':'file',21)}</span><span title="${esc(f.name)}">${esc(f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
   }
   async function load() {
     try {
@@ -126,13 +129,20 @@ function init(user) {
       }
       else if (state.view==='favorites') entries=await api('/favorites')
       else if (state.view==='recent') { const batches=await Promise.all(storages.filter(s=>s.online).map(s=>api('/files?'+params({storage:s.id,path:''})).catch(()=>[]))); entries=batches.flat().filter(e=>!e.directory).sort((a,b)=>new Date(b.modified)-new Date(a.modified)).slice(0,50) }
-      else entries=state.storage?await api('/files?'+params({storage:state.storage,path:state.folder})):[]
+      else entries=state.storage&&currentStorage()?.online?await api('/files?'+params({storage:state.storage,path:state.folder})):[]
       files=entries.map(asFile)
       if (state.view==='trash'&&!state.trashBrowse) files.forEach(f=>{f.id=f.trashId;f.date=date(f.modified)})
       render()
-    } catch(e) { files=[];render();showToast(e.message) }
+    } catch(e) { files=[];render();if(e.status===503)void refreshStorages(true);else showToast(e.message) }
   }
-  async function refreshStorages() { storages=await api('/storages'); if (!storages.some(s=>s.id===state.storage)) state.storage=storages[0]?.id||'';render() }
+  async function refreshStorages(force=false) {
+    const wasOnline=currentStorage()?.online
+    storages=await api('/storages'+(force?'?fresh=true':''))
+    if (!storages.some(s=>s.id===state.storage)) state.storage=storages[0]?.id||''
+    if(state.view==='all'&&currentStorage()?.online===false)files=[]
+    render()
+    if(wasOnline===false&&currentStorage()?.online&&state.view==='all')await load()
+  }
   async function selectStorage(id) { state.storage=id;state.folder='';state.view='all';state.trashBrowse=null;state.selected=null;state.search='';$('#search').value='';$('#sidebar').classList.remove('open');await load() }
   async function selectView(view) { state.view=view;state.folder='';state.trashBrowse=null;state.selected=null;state.search='';$('#search').value='';$('#sidebar').classList.remove('open');await load() }
   function openFile(f) {
@@ -317,6 +327,7 @@ function init(user) {
     else showToast('Эти файлы уже находятся в очереди')
   }
   document.addEventListener('click',e=>{
+    if(e.target.closest('#retryStorage')){void refreshStorages(true).then(()=>load()).catch(error=>showToast(error.message));return}
     if(!e.target.closest('#profileButton,#profileMenu'))$('#profileMenu').hidden=true
     if(e.target.closest('[data-upload-toggle]')){uploadPanelCollapsed=!uploadPanelCollapsed;renderUploadPanel();return}
     if(e.target.closest('[data-upload-dismiss]')){for(let i=uploadQueue.length-1;i>=0;i--)if(uploadQueue[i].status==='done')uploadQueue.splice(i,1);uploadPanelCollapsed=true;renderUploadPanel();return}
@@ -389,6 +400,7 @@ function init(user) {
     addFiles(e.dataTransfer.files,target?.directory?target.path:state.folder)
   },true)
   refreshStorages().then(load).catch(e=>showToast(e.message))
+  window.setInterval(()=>{void refreshStorages().catch(()=>{})},30000)
 }
 
 function showLogin() {

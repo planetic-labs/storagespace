@@ -27,6 +27,11 @@ admin.storage_ids = STORAGES
 app.include_router(admin.router)
 
 
+@app.exception_handler(OSError)
+async def storage_io_error(request: Request, error: OSError):
+    return JSONResponse({"detail": "Ошибка чтения хранилища. Проверьте подключение и повторите попытку."}, status_code=503)
+
+
 @contextmanager
 def database():
     DATA.mkdir(parents=True, exist_ok=True)
@@ -56,6 +61,12 @@ def startup():
             db.execute("ALTER TABLE trash ADD COLUMN directory INTEGER")
         if "user_id" not in {row["name"] for row in db.execute("PRAGMA table_info(uploads)")}:
             db.execute("ALTER TABLE uploads ADD COLUMN user_id INTEGER")
+        audit_columns = {row["name"] for row in db.execute("PRAGMA table_info(audit)")}
+        if "user_id" not in audit_columns:
+            db.execute("ALTER TABLE audit ADD COLUMN user_id INTEGER")
+        if "user_email" not in audit_columns:
+            db.execute("ALTER TABLE audit ADD COLUMN user_email TEXT")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(id DESC)")
         db.execute("""CREATE TABLE IF NOT EXISTS user_favorites(user_id INTEGER NOT NULL,
                    storage TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(user_id,storage,path))""")
     samples = {
@@ -145,9 +156,18 @@ def me(request: Request):
     return {"id": user["id"], "email": user["email"], "admin": user["admin"], "roles": user["roles"]}
 
 
-def audit(operation: str, storage: str, path: str, target: str | None = None):
+def audit(request: Request, operation: str, storage: str, path: str, target: str | None = None):
+    user = actor(request)
     with database() as db:
-        db.execute("INSERT INTO audit(at,operation,storage,path,target) VALUES(?,?,?,?,?)", (now(), operation, storage, path, target))
+        db.execute("INSERT INTO audit(at,operation,storage,path,target,user_id,user_email) VALUES(?,?,?,?,?,?,?)",
+                   (now(), operation, storage, path, target, user["id"], user["email"]))
+
+
+@app.get("/healthz")
+def healthz():
+    with database() as db:
+        db.execute("SELECT 1").fetchone()
+    return {"ok": True}
 
 
 class PathBody(BaseModel):
@@ -168,8 +188,8 @@ class CompleteUploadBody(BaseModel):
 
 
 @app.get("/api/storages")
-def storages(request: Request):
-    return [storage.status() for storage in STORAGES.values()
+def storages(request: Request, fresh: bool = False):
+    return [storage.status(force=fresh) for storage in STORAGES.values()
             if authz.can_traverse(actor(request), storage.id, "")]
 
 
@@ -201,7 +221,7 @@ def preview(request: Request, storage: str, path: str):
 def mkdir(body: PathBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
     result = adapter(body.storage).mkdir(body.path)
-    audit("mkdir", body.storage, body.path)
+    audit(request, "mkdir", body.storage, body.path)
     return result
 
 
@@ -265,7 +285,7 @@ def complete_upload(upload_id: str, request: Request, body: CompleteUploadBody |
     result = adapter(row["storage"]).finish_upload(upload_id, path, row["size"])
     with database() as db:
         db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
-    audit("upload", row["storage"], path)
+    audit(request, "upload", row["storage"], path)
     return result
 
 
@@ -275,6 +295,7 @@ def cancel_upload(upload_id: str, request: Request):
     adapter(row["storage"]).abort_upload(upload_id)
     with database() as db:
         db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
+    audit(request, "upload_cancel", row["storage"], row["path"])
     return {"ok": True}
 
 
@@ -293,7 +314,7 @@ def move(body: MoveBody, request: Request):
             db.execute("""UPDATE grants SET path=? || substr(path, length(?) + 1)
                           WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')""",
                        (body.target, body.path, body.storage, body.path, body.path, body.path))
-    audit("move", body.storage, body.path, body.target)
+    audit(request, "move", body.storage, body.path, body.target)
     return result
 
 
@@ -343,7 +364,7 @@ def trash(body: PathBody, request: Request):
         db.execute("INSERT INTO trash(id,storage,original_path,trashed_path,deleted_at,directory) VALUES(?,?,?,?,?,?)",
                    (trash_id, body.storage, body.path, trash_id, now(), int(directory)))
         db.execute("DELETE FROM user_favorites WHERE storage=? AND (path=? OR path LIKE ?)", (body.storage, body.path, body.path + "/%"))
-    audit("trash", body.storage, body.path)
+    audit(request, "trash", body.storage, body.path)
     return {"id": trash_id}
 
 
@@ -386,7 +407,7 @@ def restore(trash_id: str, request: Request):
     adapter(row["storage"]).restore(trash_id, row["original_path"])
     with database() as db:
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
-    audit("restore", row["storage"], row["original_path"])
+    audit(request, "restore", row["storage"], row["original_path"])
     return {"ok": True}
 
 
@@ -397,5 +418,5 @@ def delete_forever(trash_id: str, request: Request):
     adapter(row["storage"]).purge(trash_id)
     with database() as db:
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
-    audit("delete_forever", row["storage"], row["original_path"])
+    audit(request, "delete_forever", row["storage"], row["original_path"])
     return {"ok": True}
