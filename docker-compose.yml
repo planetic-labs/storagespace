@@ -1,0 +1,27 @@
+name: storagespace-dev
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      APP_DATA: /data
+      STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"}]'
+    volumes:
+      - app_data:/data
+      - ./storage:/storage/test:rw
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:${APP_PORT:-50007}:80"
+    logging: *logging
+volumes:
+  app_data:
