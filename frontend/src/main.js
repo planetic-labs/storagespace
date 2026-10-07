@@ -65,8 +65,8 @@ function init(user) {
   const state = { storage:'', folder:'', view:'all', selected:null, search:'', trashBrowse:null }
   const currentStorage = () => storages.find(s => s.id === state.storage)
   const fileById = id => files.find(f => f.id === id)
-  const fileUrl = (f, kind='preview') => '/api/' + kind + '?' + params({storage:f.storage,path:f.path})
-  const asFile = (entry, index) => ({ ...entry, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
+  const fileUrl = (f, kind='preview') => f.fileId ? '/api/files/'+encodeURIComponent(f.fileId)+'/content?download='+(kind==='download'?'true':'false') : '/api/' + kind + '?' + params({storage:f.storage,path:f.path})
+  const asFile = (entry, index) => ({ ...entry, fileId:entry.id||null, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
   function showToast(message) { const target=$('#toast'); target.textContent=message; target.classList.add('open'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>target.classList.remove('open'),3500) }
   const uploadKey = task => 'storagespace-upload:'+task.storage+':'+task.path+':'+task.file.size+':'+task.file.lastModified
   function renderUploadPanel() {
@@ -84,13 +84,13 @@ function init(user) {
       return `<div class="upload-item ${task.status}"><span class="upload-file-icon" aria-hidden="true">${icon('file',17)}</span><span class="upload-item-name" title="${esc(task.file.name)}">${esc(task.file.name)}</span>${status}</div>`
     }).join('')}</div>`
   }
-  function closeModal() { $('#overlay').classList.remove('open'); $('#modal').innerHTML='' }
-  function modal(title, content, compact=false) { $('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
+  function closeModal() { $('#overlay').classList.remove('open');delete $('#modal').dataset.fileId;$('#modal').innerHTML='' }
+  function modal(title, content, compact=false) { delete $('#modal').dataset.fileId;$('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
   function closeMenu() { $('#context').classList.remove('open') }
   function showContextMenu(f,x,y) {
     if (!f||f.trashChild) return
     const c=$('#context')
-    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button class="danger" data-menu="trash">В корзину</button>`
+    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button><button data-menu="details">Сведения</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button class="danger" data-menu="trash">В корзину</button>`
     c.dataset.id=f.id; c.classList.add('open'); c.style.left=Math.max(8,Math.min(x,innerWidth-c.offsetWidth-8))+'px'; c.style.top=Math.max(8,Math.min(y,innerHeight-c.offsetHeight-8))+'px'
   }
   function render() {
@@ -165,11 +165,30 @@ function init(user) {
     modal(f.name,`<div class="real-preview">${content}</div><div class="modal-footer"><a class="primary-button" href="${fileUrl(f,'download')}">Скачать</a></div>`)
   }
   function download(f) { window.open(fileUrl(f,'download'),'_blank') }
+  async function details(f) {
+    if(!f.fileId)return showToast('Обновите папку и попробуйте снова')
+    modal('Сведения о файле','<p class="modal-note">Загрузка сведений…</p>',true)
+    $('#modal').dataset.fileId=f.fileId
+    const refresh=async()=>{
+      try {
+        const item=await api('/files/'+encodeURIComponent(f.fileId))
+        if($('#modal').dataset.fileId!==f.fileId||!$('#overlay').classList.contains('open'))return
+        const hash=item.hash_status==='ready'?`<code class="file-hash">${esc(item.sha256)}</code>`:item.hash_status==='queued'||item.hash_status==='running'?'Рассчитывается…':item.hash_status==='error'?'Ошибка расчёта':'Не рассчитан'
+        const button=['not_computed','error'].includes(item.hash_status)?'<button class="soft-button" id="calculateHash">Рассчитать SHA-256</button>':''
+        $('#modal').innerHTML=`<div class="modal-header"><h2>Сведения о файле</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div><div class="file-details"><strong>${esc(f.name)}</strong><dl><dt>ID файла</dt><dd><code>${esc(item.id)}</code></dd><dt>Размер</dt><dd>${size(item.size)}</dd><dt>SHA-256</dt><dd>${hash}</dd></dl>${button}</div>`
+        $('#closeModal').onclick=closeModal
+        if(button)$('#calculateHash').onclick=async()=>{try{await api('/files/'+encodeURIComponent(f.fileId)+'/sha256',{method:'POST'});await refresh()}catch(error){showToast(error.message)}}
+        if(['queued','running'].includes(item.hash_status))setTimeout(()=>{if($('#modal').dataset.fileId===f.fileId&&$('#overlay').classList.contains('open'))void refresh()},2500)
+      } catch(error) {if($('#modal').dataset.fileId===f.fileId)showToast(error.message)}
+    }
+    await refresh()
+  }
   async function mutate(fn,success) { try {await fn();closeModal();closeMenu();await load();await refreshStorages();if(success)showToast(success)}catch(e){showToast(e.message)} }
   async function action(name,f) {
     closeMenu();if(!f)return
     if(name==='preview')return openFile(f)
     if(name==='download')return download(f)
+    if(name==='details')return details(f)
     if(name==='favorite')return mutate(()=>api('/favorite',jsonBody({storage:f.storage,path:f.path})),f.favorite?'Убрано из избранного':'Добавлено в избранное')
     if(name==='trash')return mutate(()=>api('/trash',jsonBody({storage:f.storage,path:f.path})),'Перемещено в корзину')
     if(name==='restore')return mutate(()=>api('/trash/'+f.trashId+'/restore',{method:'POST'}),'Восстановлено')

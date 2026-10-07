@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from storage import MountedStorage, Storage
 import authz
 import admin
+import metadata
 
 DATA = Path(os.getenv("APP_DATA", "/data"))
 DB = DATA / "app.sqlite3"
@@ -67,6 +68,7 @@ def startup():
         if "user_email" not in audit_columns:
             db.execute("ALTER TABLE audit ADD COLUMN user_email TEXT")
         db.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(id DESC)")
+        metadata.initialize(db)
         db.execute("""CREATE TABLE IF NOT EXISTS user_favorites(user_id INTEGER NOT NULL,
                    storage TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(user_id,storage,path))""")
     samples = {
@@ -196,13 +198,62 @@ def storages(request: Request, fresh: bool = False):
 @app.get("/api/files")
 def files(request: Request, storage: str, path: str = "", search: str = ""):
     check(request, storage, path, traverse=True)
-    entries = adapter(storage).list_dir(path, search)
+    entries = adapter(storage).list_dir(path)
     with database() as db:
+        metadata.sync_directory(db, storage, path, entries)
         favorites = {(r["storage"], r["path"]) for r in db.execute("SELECT storage,path FROM user_favorites WHERE user_id=?", (actor(request)["id"],))}
-    entries = [entry for entry in entries if authz.can_traverse(actor(request), storage, entry["path"])]
+    entries = [entry for entry in entries if search.casefold() in entry["name"].casefold()
+               and authz.can_traverse(actor(request), storage, entry["path"])]
     for entry in entries:
         entry["favorite"] = (storage, entry["path"]) in favorites
     return entries
+
+
+def file_record(request: Request, file_id: str) -> dict:
+    with database() as db:
+        record = metadata.get(db, file_id)
+    if not record or record["status"] != "active":
+        raise HTTPException(404, "Файл не найден")
+    check(request, record["storage"], record["path"])
+    try:
+        entry = adapter(record["storage"]).info(record["path"])
+    except HTTPException as error:
+        if error.status_code == 404:
+            with database() as db:
+                metadata.set_status(db, record["storage"], record["path"], "missing")
+        raise
+    if entry["directory"]:
+        with database() as db:
+            metadata.set_status(db, record["storage"], record["path"], "missing")
+        raise HTTPException(404, "Файл не найден")
+    with database() as db:
+        metadata.observe(db, entry)
+        return metadata.get(db, file_id)
+
+
+@app.get("/api/files/{file_id}")
+def file_metadata(file_id: str, request: Request):
+    return file_record(request, file_id)
+
+
+@app.get("/api/files/{file_id}/content")
+def file_content(file_id: str, request: Request, download: bool = False):
+    record = file_record(request, file_id)
+    return adapter(record["storage"]).serve(record["path"], inline=not download)
+
+
+@app.post("/api/files/{file_id}/sha256")
+def calculate_sha256(file_id: str, request: Request):
+    record = file_record(request, file_id)
+    try:
+        with database() as db:
+            queued = metadata.queue_hash(db, record)
+    except RuntimeError as error:
+        raise HTTPException(429, str(error)) from None
+    if queued:
+        metadata.start_hash(record, adapter(record["storage"]))
+    with database() as db:
+        return metadata.get(db, file_id)
 
 
 @app.get("/api/download")
@@ -285,6 +336,7 @@ def complete_upload(upload_id: str, request: Request, body: CompleteUploadBody |
     result = adapter(row["storage"]).finish_upload(upload_id, path, row["size"])
     with database() as db:
         db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
+        metadata.observe(db, result)
     audit(request, "upload", row["storage"], path)
     return result
 
@@ -303,9 +355,14 @@ def cancel_upload(upload_id: str, request: Request):
 def move(body: MoveBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
     check(request, body.storage, body.target.rsplit("/", 1)[0] if "/" in body.target else "", 2)
-    directory = adapter(body.storage).is_dir(body.path)
+    source_info = adapter(body.storage).info(body.path)
+    directory = source_info["directory"]
+    if not directory:
+        with database() as db:
+            metadata.observe(db, source_info)
     result = adapter(body.storage).move(body.path, body.target)
     with database() as db:
+        metadata.move_path(db, body.storage, body.path, body.target)
         db.execute("""UPDATE user_favorites
                       SET path=? || substr(path, length(?) + 1)
                       WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')""",
@@ -340,7 +397,10 @@ def favorites(request: Request):
         if not authz.permission(actor(request), row["storage"], row["path"]):
             continue
         try:
-            result.append({**adapter(row["storage"]).info(row["path"]), "favorite": True})
+            entry = adapter(row["storage"]).info(row["path"])
+            with database() as db:
+                entry["id"] = metadata.observe(db, entry)
+            result.append({**entry, "favorite": True})
         except HTTPException:
             pass
     return result
@@ -352,6 +412,9 @@ def trash(body: PathBody, request: Request):
     trash_id = uuid.uuid4().hex
     selected = adapter(body.storage)
     directory = selected.is_dir(body.path)
+    if not directory:
+        with database() as db:
+            metadata.observe(db, selected.info(body.path))
     if directory:
         with database() as db:
             grant = db.execute("""SELECT 1 FROM grants WHERE storage=? AND
@@ -361,6 +424,7 @@ def trash(body: PathBody, request: Request):
             raise HTTPException(409, "Сначала уберите права доступа к этой папке и вложенным папкам")
     selected.trash(body.path, trash_id)
     with database() as db:
+        metadata.set_status(db, body.storage, body.path, "trashed")
         db.execute("INSERT INTO trash(id,storage,original_path,trashed_path,deleted_at,directory) VALUES(?,?,?,?,?,?)",
                    (trash_id, body.storage, body.path, trash_id, now(), int(directory)))
         db.execute("DELETE FROM user_favorites WHERE storage=? AND (path=? OR path LIKE ?)", (body.storage, body.path, body.path + "/%"))
@@ -406,6 +470,7 @@ def restore(trash_id: str, request: Request):
     check(request, row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "", 2)
     adapter(row["storage"]).restore(trash_id, row["original_path"])
     with database() as db:
+        metadata.set_status(db, row["storage"], row["original_path"], "active")
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
     audit(request, "restore", row["storage"], row["original_path"])
     return {"ok": True}
@@ -417,6 +482,7 @@ def delete_forever(trash_id: str, request: Request):
     check(request, row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "", 2)
     adapter(row["storage"]).purge(trash_id)
     with database() as db:
+        metadata.set_status(db, row["storage"], row["original_path"], "missing")
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
     audit(request, "delete_forever", row["storage"], row["original_path"])
     return {"ok": True}

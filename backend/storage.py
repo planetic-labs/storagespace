@@ -27,6 +27,7 @@ class Storage(Protocol):
     def exists(self, path: str) -> bool: ...
     def is_dir(self, path: str) -> bool: ...
     def serve(self, path: str, inline: bool) -> Response: ...
+    def open_for_hash(self, path: str) -> BinaryIO: ...
     def upload(self, path: str, source: BinaryIO) -> dict: ...
     def mkdir(self, path: str) -> dict: ...
     def move(self, source: str, target: str) -> dict: ...
@@ -110,6 +111,7 @@ class MountedStorage:
         return {"storage": self.id, "path": path.relative_to(self.root).as_posix(),
                 "name": path.name, "directory": stat.S_ISDIR(info.st_mode),
                 "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
                 "modified": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()}
 
     def status(self, force: bool = False) -> dict:
@@ -183,6 +185,12 @@ class MountedStorage:
             raise HTTPException(404, "Файл не найден")
         return FileResponse(file, filename=file.name,
                             content_disposition_type="inline" if inline else "attachment")
+
+    def open_for_hash(self, path: str) -> BinaryIO:
+        file = self._path(path)
+        if not file.is_file():
+            raise HTTPException(404, "Файл не найден")
+        return file.open("rb")
 
     def upload(self, path: str, source: BinaryIO) -> dict:
         target = self._path(path)
