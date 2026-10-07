@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Storage Space remote storage bind mounts
+After=docker.service
+ConditionPathExists=/var/run/docker.sock
+
+[Service]
+Type=oneshot
+User=devman
+Group=devman
+SupplementaryGroups=docker
+WorkingDirectory=/home/devman/workspace/storagespace
+ExecStart=/usr/bin/bash /home/devman/workspace/storagespace/deploy/systemd/check-sshfs-bind.sh
+TimeoutStartSec=180

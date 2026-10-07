@@ -6,10 +6,11 @@ services:
     user: "1000:1000"
     environment:
       APP_DATA: /data
-      STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"}]'
+      STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"},{"id":"prosvetlenie","name":"Просветление","path":"/storage/prosvetlenie","mode":"sshfs"}]'
     volumes:
       - app_data:/data
       - ./storage:/storage/test:rw
+      - /mnt/storagespace-prosvetlenie:/storage/prosvetlenie:rw
     logging: &logging
       driver: json-file
       options:

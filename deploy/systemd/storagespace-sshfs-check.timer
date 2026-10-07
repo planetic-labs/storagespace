@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Storage Space SSHFS bind mount every minute
+
+[Timer]
+OnBootSec=30s
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=storagespace-sshfs-check.service
+
+[Install]
+WantedBy=timers.target

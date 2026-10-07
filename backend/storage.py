@@ -52,7 +52,21 @@ class MountedStorage:
         self._upload_locks: dict[str, asyncio.Lock] = {}
 
     def _online(self) -> bool:
-        return self.root.is_dir() and (self.mode == "local" or os.path.ismount(self.root))
+        if self.mode == "local":
+            return self.root.is_dir()
+        # A Docker bind mount is itself a mount point even when SSHFS is absent.
+        # Check the filesystem actually bound into this container instead.
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+                for line in mounts:
+                    if " - " not in line:
+                        continue
+                    mount, filesystem = line.split(" - ", 1)
+                    if mount.split()[4] == str(self.root) and filesystem.split()[0] == "fuse.sshfs":
+                        return self.root.is_dir()
+            return False
+        except OSError:
+            return False
 
     def _require_online(self) -> None:
         if not self._online():
@@ -65,7 +79,7 @@ class MountedStorage:
         if not path or path.startswith("/") or "\\" in path or "\x00" in path:
             raise HTTPException(400, "Некорректный путь")
         parts = path.split("/")
-        if any(x in ("", ".", "..") for x in parts) or parts[0] in (".storage-space-trash", ".storage-space-uploads"):
+        if any(x in ("", ".", "..") or x.startswith(".") for x in parts):
             raise HTTPException(400, "Некорректный путь")
         if any(len(part.encode("utf-8")) > 255 for part in parts):
             raise HTTPException(400, "Имя файла или папки слишком длинное")
@@ -91,8 +105,11 @@ class MountedStorage:
         online = self._online()
         free = total = None
         if online:
-            usage = shutil.disk_usage(self.root)
-            free, total = usage.free, usage.total
+            try:
+                usage = shutil.disk_usage(self.root)
+                free, total = usage.free, usage.total
+            except OSError:
+                online = False
         return {"id": self.id, "name": self.name, "online": online, "free": free, "total": total}
 
     def list_dir(self, path: str, search: str = "") -> list[dict]:
@@ -100,7 +117,7 @@ class MountedStorage:
         if not directory.is_dir():
             raise HTTPException(404, "Папка не найдена")
         entries = [self._info(p) for p in directory.iterdir()
-                   if p.name not in (".storage-space-trash", ".storage-space-uploads") and not p.is_symlink()
+                   if not p.name.startswith(".") and not p.is_symlink()
                    and search.casefold() in p.name.casefold()]
         return sorted(entries, key=lambda x: (not x["directory"], x["name"].casefold()))
 

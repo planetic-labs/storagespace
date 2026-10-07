@@ -15,8 +15,9 @@ const api = async (route, options={}) => {
   }
   return response.json()
 }
-const gb = bytes => bytes == null ? '—' : (bytes / 1e9).toFixed(1).replace('.0','') + ' ГБ'
-const size = bytes => bytes == null ? '—' : bytes >= 1e9 ? gb(bytes) : bytes >= 1e6 ? (bytes/1e6).toFixed(1).replace('.',',') + ' МБ' : bytes >= 1e3 ? Math.round(bytes/1e3) + ' КБ' : bytes + ' Б'
+const formatUnit = (value, digits, unit) => value.toFixed(digits).replace(/\.0+$/, '') + ' ' + unit
+const capacity = bytes => bytes == null ? '—' : bytes >= 1024 ** 4 ? formatUnit(bytes / 1024 ** 4, 2, 'ТБ') : formatUnit(bytes / 1024 ** 3, 1, 'ГБ')
+const size = bytes => bytes == null ? '—' : bytes >= 1024 ** 3 ? capacity(bytes) : bytes >= 1024 ** 2 ? formatUnit(bytes / 1024 ** 2, 1, 'МБ') : bytes >= 1024 ? formatUnit(bytes / 1024, 0, 'КБ') : bytes + ' Б'
 const date = value => {
   if (!value) return '—'
   const day = new Date(value), today = new Date()
@@ -35,6 +36,7 @@ const suggestedFilename = name => {
 }
 
 function init() {
+  $('#serviceVersion').textContent=__APP_VERSION__
   let storages = [], files = []
   let uploadBusy = false
   const fileDragHint=document.createElement('div')
@@ -61,7 +63,7 @@ function init() {
   }
   function render() {
     const active=currentStorage()
-    $('#sideStorages').innerHTML=storages.map(s=>`<button class="storage ${s.id===state.storage&&state.view==='all'?'active':''}" data-storage="${esc(s.id)}" aria-label="${esc(s.name)}: ${s.online?'свободно '+gb(s.free)+' из '+gb(s.total):'недоступно'}">${icon('drive',18)}<span class="storage-info"><span class="storage-name">${esc(s.name)}</span><span class="storage-sub">${s.online?'Свободно '+gb(s.free)+' из '+gb(s.total):'Хранилище недоступно'}</span><span class="storage-meter"><i style="width:${s.online&&s.total?Math.round((s.total-s.free)/s.total*100):0}%"></i></span></span></button>`).join('')
+    $('#sideStorages').innerHTML=storages.map(s=>`<button class="storage ${s.id===state.storage&&state.view==='all'?'active':''}" data-storage="${esc(s.id)}" aria-label="${esc(s.name)}: ${s.online?'свободно '+capacity(s.free)+' из '+capacity(s.total):'недоступно'}">${icon('drive',18)}<span class="storage-info"><span class="storage-name">${esc(s.name)}</span><span class="storage-sub">${s.online?'Свободно '+capacity(s.free)+' из '+capacity(s.total):'Хранилище недоступно'}</span><span class="storage-meter"><i style="width:${s.online&&s.total?Math.round((s.total-s.free)/s.total*100):0}%"></i></span></span></button>`).join('')
     document.querySelectorAll('.nav').forEach(button=>button.classList.toggle('active',button.dataset.nav===state.view))
     $('#eyebrow').textContent=state.view==='trash'?'УДАЛЁННЫЕ ФАЙЛЫ':state.view==='all'?'РАБОЧЕЕ ПРОСТРАНСТВО':'БЫСТРЫЙ ДОСТУП'
     $('#pageTitle').textContent=state.view==='trash'?'Корзина':state.view==='recent'?'Недавние':state.view==='favorites'?'Избранное':state.folder?state.folder.split('/').at(-1):'Все файлы'
@@ -182,7 +184,7 @@ function init() {
   $('#rows').addEventListener('dragleave',e=>{const row=e.target.closest('.row');if(row)row.classList.remove('drag-over')})
   $('#rows').addEventListener('drop',e=>{const row=e.target.closest('.row'),target=row&&fileById(row.dataset.id);if(row)row.classList.remove('drag-over');if(e.dataTransfer?.files?.length)return;const source=fileById(e.dataTransfer.getData('text/plain'));if(target?.directory&&source&&target.path!==source.path){e.preventDefault();mutate(()=>api('/move',jsonBody({storage:source.storage,path:source.path,target:target.path+'/'+source.name})),'Файл перемещён')}})
   $('#search').oninput=e=>{state.search=e.target.value;render()}
-  $('#newFolderTop').onclick=createFolder;$('#newFolderHeading').onclick=createFolder;$('#uploadTop').onclick=uploadModal
+  $('#newFolderHeading').onclick=createFolder;$('#uploadTop').onclick=uploadModal
   $('#fileInput').onchange=e=>{addFiles(e.target.files);e.target.value=''}
   $('#menuToggle').onclick=()=>$('#sidebar').classList.toggle('open')
   $('#overlay').onclick=e=>{if(e.target===$('#overlay'))closeModal()}
