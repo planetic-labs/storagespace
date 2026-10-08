@@ -17,6 +17,7 @@ jobs:
         run: |
           bash -n scripts/release.sh
           ./scripts/release.sh --dry-run
+          python3 -m unittest discover -s tests
           cp .env.auth.example .env.auth
           docker compose --env-file .env.prod.example -f docker-compose.prod.yml config --quiet
 
