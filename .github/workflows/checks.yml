@@ -15,6 +15,6 @@ jobs:
       matrix:
         component: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build ${{ matrix.component }} image
         run: docker build --file "${{ matrix.component }}/Dockerfile" "${{ matrix.component }}"
