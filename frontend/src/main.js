@@ -48,7 +48,7 @@ const suggestedFilename = name => {
 }
 
 function init(user) {
-  const displayName=user.email.split('@')[0].replace(/[._-]+/g,' ').trim()||user.email
+  const displayName=user.first_name?.trim()||user.email.split('@')[0].replace(/[._-]+/g,' ').trim()||user.email
   $('#profileName').textContent=displayName
   $('#profileAvatar').textContent=displayName.split(' ').map(part=>part[0]||'').slice(0,2).join('').toUpperCase()
   const installed=window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true
@@ -89,10 +89,11 @@ function init(user) {
   const externalFiles=e=>Array.from(e.dataTransfer?.types||[]).includes('Files')
   const hideFileDrag=()=>{fileDragHint.classList.remove('open');clearTimeout(fileDragTimer)}
   const state = { storage:'', folder:'', view:'all', selected:null, search:'', trashBrowse:null }
+  let personalLabels={}
   const currentStorage = () => storages.find(s => s.id === state.storage)
   const fileById = id => files.find(f => f.id === id)
   const fileUrl = (f, kind='preview') => f.fileId ? '/api/files/'+encodeURIComponent(f.fileId)+'/content?download='+(kind==='download'?'true':'false') : '/api/' + kind + '?' + params({storage:f.storage,path:f.path})
-  const asFile = (entry, index) => ({ ...entry, fileId:entry.id||null, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
+  const asFile = (entry, index) => ({ ...entry, displayName:entry.display_name, fileId:entry.id||null, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
   const ensureFileId = async f => {
     if(f.fileId)return f.fileId
     const record=await api('/files/resolve',jsonBody({storage:f.storage,path:f.path}))
@@ -125,7 +126,7 @@ function init(user) {
   function showContextMenu(f,x,y) {
     if (!f||f.trashChild) return
     const c=$('#context')
-    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button><button data-menu="details">Сведения</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button class="danger" data-menu="trash">В корзину</button>`
+    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button><button data-menu="details">Сведения</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button data-menu="copy">Копировать</button><button class="danger" data-menu="trash">В корзину</button>`
     c.dataset.id=f.id; c.classList.add('open'); c.style.left=Math.max(8,Math.min(x,innerWidth-c.offsetWidth-8))+'px'; c.style.top=Math.max(8,Math.min(y,innerHeight-c.offsetHeight-8))+'px'
   }
   function render() {
@@ -145,11 +146,11 @@ function init(user) {
       $('#breadcrumbs').innerHTML=crumbs.map((crumb,i)=>`${i?'<span>›</span>':''}<button class="crumb" ${crumb.root?'data-trash-root="true"':`data-trash-crumb="${esc(crumb.path)}"`}>${esc(crumb.name)}</button>`).join('')
     }else{
       const crumbs=[{name:active?.name||'Хранилище',path:''}]
-      if(state.view==='all'&&state.folder)state.folder.split('/').forEach((name,i,all)=>crumbs.push({name,path:all.slice(0,i+1).join('/')}))
+      if(state.view==='all'&&state.folder)state.folder.split('/').forEach((name,i,all)=>{const path=all.slice(0,i+1).join('/');crumbs.push({name:personalLabels[path]||name,path})})
       $('#breadcrumbs').innerHTML=crumbs.map((crumb,i)=>`${i?'<span>›</span>':''}<button class="crumb" data-crumb="${esc(crumb.path)}" title="Открыть папку или перетащить сюда файл">${esc(crumb.name)}</button>`).join('')
     }
-    const visible=files.filter(f=>(f.name||'').toLocaleLowerCase('ru').includes(state.search.toLocaleLowerCase('ru')))
-    $('#rows').innerHTML=offline?`<div class="empty storage-offline">${icon('drive',42)}<h3>Хранилище недоступно</h3><p>Проверяем подключение автоматически. После восстановления монтирования файлы появятся здесь.</p><button class="soft-button" id="retryStorage">Проверить сейчас</button></div>`:visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(f.type==='folder'?'folder':'file',21)}</span><span title="${esc(f.name)}">${esc(f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
+    const visible=files.filter(f=>(f.displayName||f.name||'').toLocaleLowerCase('ru').includes(state.search.toLocaleLowerCase('ru')))
+    $('#rows').innerHTML=offline?`<div class="empty storage-offline">${icon('drive',42)}<h3>Хранилище недоступно</h3><p>Проверяем подключение автоматически. После восстановления монтирования файлы появятся здесь.</p><button class="soft-button" id="retryStorage">Проверить сейчас</button></div>`:visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(f.type==='folder'?'folder':'file',21)}</span><span title="${esc(f.displayName||f.name)}">${esc(f.displayName||f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.displayName||f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.displayName||f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
   }
   async function load() {
     try {
@@ -165,6 +166,8 @@ function init(user) {
       else if (state.view==='favorites') entries=await api('/favorites')
       else if (state.view==='recent') { const batches=await Promise.all(storages.filter(s=>s.online).map(s=>api('/files?'+params({storage:s.id,path:''})).catch(()=>[]))); entries=batches.flat().filter(e=>!e.directory).sort((a,b)=>new Date(b.modified)-new Date(a.modified)).slice(0,50) }
       else entries=state.storage&&currentStorage()?.online?await api('/files?'+params({storage:state.storage,path:state.folder})):[]
+      if(state.view==='all'&&state.storage&&currentStorage()?.online)personalLabels=await api('/personal-folders?'+params({storage:state.storage,path:state.folder}))
+      else personalLabels={}
       files=entries.map(asFile)
       if (state.view==='trash'&&!state.trashBrowse) files.forEach(f=>{f.id=f.trashId;f.date=date(f.modified)})
       render()
@@ -237,6 +240,7 @@ function init(user) {
     if(name==='restore')return mutate(()=>api('/trash/'+f.trashId+'/restore',{method:'POST'}),'Восстановлено')
     if(name==='permanent') {modal('Удалить окончательно?',`<p style="font-size:14px;line-height:1.5;color:#69768a">«${esc(f.name)}» нельзя будет восстановить.</p><div class="modal-footer"><button class="soft-button" id="cancelDelete">Отмена</button><button class="primary-button" id="confirmDelete">Удалить</button></div>`,true);$('#cancelDelete').onclick=closeModal;$('#confirmDelete').onclick=()=>mutate(()=>api('/trash/'+f.trashId,{method:'DELETE'}),'Удалено');return}
     if(name==='move')return moveModal(f)
+    if(name==='copy')return moveModal(f,true)
     if(name==='rename') {
       modal('Переименовать',`<label class="field" for="renameInput">Новое имя</label><input class="text-field" id="renameInput" value="${esc(f.name)}"><div class="modal-footer"><button class="soft-button" id="cancelRename">Отмена</button><button class="primary-button" id="confirmRename">Переименовать</button></div>`,true)
       $('#renameInput').focus();$('#renameInput').select();$('#cancelRename').onclick=closeModal
@@ -245,15 +249,18 @@ function init(user) {
       return
     }
   }
-  function moveModal(f) {
+  function moveModal(f,copy=false) {
     const originalParent=f.path.split('/').slice(0,-1).join('/')
     let destination=originalParent, requestId=0
-    modal('Переместить',`<p class="move-hint">Выберите папку в хранилище «${esc(storages.find(s=>s.id===f.storage)?.name||f.storage)}».</p><div id="movePicker"></div><div class="modal-footer"><button class="soft-button" id="cancelMove">Отмена</button><button class="primary-button" id="confirmMove" disabled>Переместить сюда</button></div>`,true)
+    modal(copy?'Копировать':'Переместить',`<p class="move-hint">Выберите папку в хранилище «${esc(storages.find(s=>s.id===f.storage)?.name||f.storage)}».</p><div id="movePicker"></div>${copy?`<label class="field" for="copyName">Имя копии</label><input class="text-field" id="copyName" value="${esc('Копия — '+f.name)}">`:''}<div class="modal-footer"><button class="soft-button" id="cancelMove">Отмена</button><button class="primary-button" id="confirmMove" disabled>${copy?'Копировать сюда':'Переместить сюда'}</button></div>`,true)
     $('#cancelMove').onclick=closeModal
     $('#confirmMove').onclick=()=>{
-      const target=[destination,f.name].filter(Boolean).join('/')
-      if(target!==f.path)void mutate(()=>api('/move',jsonBody({storage:f.storage,path:f.path,target})),'Перемещено')
+      const name=copy?$('#copyName').value.trim():f.name
+      if(!name||name==='.'||name==='..'||name.startsWith('.')||name.includes('/')||name.includes('\\'))return showToast('Некорректное имя')
+      const target=[destination,name].filter(Boolean).join('/')
+      if(target!==f.path)void mutate(()=>api(copy?'/copy':'/move',jsonBody({storage:f.storage,path:f.path,target})),copy?'Скопировано':'Перемещено')
     }
+    if(copy)$('#copyName').oninput=()=>{$('#confirmMove').disabled=!$('#copyName').value.trim()}
     $('#movePicker').onclick=e=>{
       const option=e.target.closest('[data-move-path]')
       if(option){destination=option.dataset.movePath;void renderPicker()}
@@ -263,7 +270,7 @@ function init(user) {
       if(!picker||!confirm)return
       confirm.disabled=true
       const parts=destination?destination.split('/'):[]
-      const trail=[{name:storages.find(s=>s.id===f.storage)?.name||'Хранилище',path:''},...parts.map((name,i)=>({name,path:parts.slice(0,i+1).join('/')}))]
+      const trail=[{name:storages.find(s=>s.id===f.storage)?.name||'Хранилище',path:''},...parts.map((name,i)=>{const path=parts.slice(0,i+1).join('/');return {name:personalLabels[path]||name,path}})]
       const breadcrumbs=trail.map((part,i)=>`${i?'<span>›</span>':''}<button type="button" data-move-path="${esc(part.path)}" class="${part.path===destination?'current':''}">${esc(part.name)}</button>`).join('')
       picker.innerHTML=`<div class="move-breadcrumbs">${breadcrumbs}</div><div class="folder-options"><div class="move-loading">Загрузка папок…</div></div>`
       try {
@@ -271,8 +278,8 @@ function init(user) {
         if(currentRequest!==requestId||picker!==$('#movePicker'))return
         const folders=entries.filter(item=>item.directory&&item.path!==f.path&&!(f.directory&&item.path.startsWith(f.path+'/')))
         const parent=parts.slice(0,-1).join('/')
-        picker.querySelector('.folder-options').innerHTML=`${destination?`<button type="button" class="folder-option" data-move-path="${esc(parent)}">↑ На уровень выше</button>`:''}${folders.map(item=>`<button type="button" class="folder-option" data-move-path="${esc(item.path)}">${icon('folder',16)} ${esc(item.name)}</button>`).join('')}${!folders.length?'<div class="move-empty">Вложенных папок нет</div>':''}`
-        confirm.disabled=[destination,f.name].filter(Boolean).join('/')===f.path
+        picker.querySelector('.folder-options').innerHTML=`${destination?`<button type="button" class="folder-option" data-move-path="${esc(parent)}">↑ На уровень выше</button>`:''}${folders.map(item=>`<button type="button" class="folder-option" data-move-path="${esc(item.path)}">${icon('folder',16)} ${esc(item.display_name||item.name)}</button>`).join('')}${!folders.length?'<div class="move-empty">Вложенных папок нет</div>':''}`
+        confirm.disabled=copy?!$('#copyName').value.trim():[destination,f.name].filter(Boolean).join('/')===f.path
       } catch(error) {
         if(currentRequest!==requestId||picker!==$('#movePicker'))return
         picker.querySelector('.folder-options').innerHTML=`<div class="move-error">${esc(error.message)}</div>`

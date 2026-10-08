@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Protocol
@@ -31,6 +32,7 @@ class Storage(Protocol):
     def upload(self, path: str, source: BinaryIO) -> dict: ...
     def mkdir(self, path: str) -> dict: ...
     def move(self, source: str, target: str) -> dict: ...
+    def copy(self, source: str, target: str) -> dict: ...
     def trash(self, path: str, trash_id: str) -> None: ...
     def trash_exists(self, trash_id: str) -> bool: ...
     def trash_is_dir(self, trash_id: str) -> bool: ...
@@ -42,6 +44,99 @@ class Storage(Protocol):
     async def append_upload(self, upload_id: str, offset: int, size: int, chunks: AsyncIterator[bytes]) -> int: ...
     def finish_upload(self, upload_id: str, path: str, size: int) -> dict: ...
     def abort_upload(self, upload_id: str) -> None: ...
+
+
+class PersonalStorage:
+    """A user's private view of a directory on a shared mounted storage."""
+
+    def __init__(self, base: Storage, storage_id: str, name: str, parent: str, user_id: int):
+        self.base, self.id, self.name = base, storage_id, name
+        self.prefix = "/".join(filter(None, (parent.strip("/"), f"user-{user_id}")))
+        parts = MountedStorage._parts(parent, allow_root=True)
+        current = ""
+        for part in [*parts, f"user-{user_id}"]:
+            current = "/".join(filter(None, (current, part)))
+            if not base.is_dir(current):
+                try:
+                    base.mkdir(current)
+                except HTTPException as error:
+                    if error.status_code != 409 or not base.is_dir(current):
+                        raise
+
+    def _real(self, path: str, *, root: bool = False) -> str:
+        MountedStorage._parts(path, allow_root=root)
+        return self.prefix + ("/" + path if path else "")
+
+    def _entry(self, entry: dict) -> dict:
+        path = entry["path"]
+        return {**entry, "storage": self.id,
+                "path": path[len(self.prefix):].lstrip("/")}
+
+    def status(self, force: bool = False) -> dict:
+        return {**self.base.status(force), "id": self.id, "name": self.name}
+
+    def list_dir(self, path: str, search: str = "") -> list[dict]:
+        return [self._entry(entry) for entry in self.base.list_dir(self._real(path, root=True), search)]
+
+    def info(self, path: str) -> dict:
+        return self._entry(self.base.info(self._real(path)))
+
+    def exists(self, path: str) -> bool:
+        return self.base.exists(self._real(path))
+
+    def is_dir(self, path: str) -> bool:
+        return self.base.is_dir(self._real(path))
+
+    def serve(self, path: str, inline: bool) -> Response:
+        return self.base.serve(self._real(path), inline)
+
+    def open_for_hash(self, path: str) -> BinaryIO:
+        return self.base.open_for_hash(self._real(path))
+
+    def upload(self, path: str, source: BinaryIO) -> dict:
+        return self._entry(self.base.upload(self._real(path), source))
+
+    def mkdir(self, path: str) -> dict:
+        return self._entry(self.base.mkdir(self._real(path)))
+
+    def move(self, source: str, target: str) -> dict:
+        return self._entry(self.base.move(self._real(source), self._real(target)))
+
+    def copy(self, source: str, target: str) -> dict:
+        return self._entry(self.base.copy(self._real(source), self._real(target)))
+
+    def trash(self, path: str, trash_id: str) -> None:
+        self.base.trash(self._real(path), trash_id)
+
+    def trash_exists(self, trash_id: str) -> bool:
+        return self.base.trash_exists(trash_id)
+
+    def trash_is_dir(self, trash_id: str) -> bool:
+        return self.base.trash_is_dir(trash_id)
+
+    def list_trashed(self, trash_id: str, path: str = "") -> list[dict]:
+        return [{**entry, "storage": self.id} for entry in self.base.list_trashed(trash_id, path)]
+
+    def restore(self, trash_id: str, path: str) -> None:
+        self.base.restore(trash_id, self._real(path))
+
+    def purge(self, trash_id: str) -> None:
+        self.base.purge(trash_id)
+
+    def create_upload(self, upload_id: str, path: str) -> None:
+        self.base.create_upload(upload_id, self._real(path))
+
+    def upload_offset(self, upload_id: str) -> int:
+        return self.base.upload_offset(upload_id)
+
+    async def append_upload(self, upload_id: str, offset: int, size: int, chunks: AsyncIterator[bytes]) -> int:
+        return await self.base.append_upload(upload_id, offset, size, chunks)
+
+    def finish_upload(self, upload_id: str, path: str, size: int) -> dict:
+        return self._entry(self.base.finish_upload(upload_id, self._real(path), size))
+
+    def abort_upload(self, upload_id: str) -> None:
+        self.base.abort_upload(upload_id)
 
 
 class MountedStorage:
@@ -225,6 +320,36 @@ class MountedStorage:
         if src.is_dir() and dst.is_relative_to(src):
             raise HTTPException(400, "Нельзя переместить папку в саму себя")
         src.rename(dst)
+        return self._info(dst)
+
+    def copy(self, source: str, target: str) -> dict:
+        src, dst = self._path(source), self._path(target)
+        if not src.exists() or not dst.parent.is_dir():
+            raise HTTPException(404, "Файл или папка не найдены")
+        if dst.exists():
+            raise HTTPException(409, "Такое имя уже существует")
+        if src.is_dir() and dst.is_relative_to(src):
+            raise HTTPException(400, "Нельзя скопировать папку внутрь самой себя")
+        temporary = dst.parent / (".storage-space-copy-" + uuid.uuid4().hex)
+        try:
+            if src.is_dir():
+                for directory, dirs, files in os.walk(src):
+                    if any((Path(directory) / name).is_symlink() for name in dirs + files):
+                        raise HTTPException(400, "Символьные ссылки не поддерживаются")
+                shutil.copytree(src, temporary, copy_function=shutil.copy2)
+            elif src.is_file():
+                shutil.copy2(src, temporary)
+            else:
+                raise HTTPException(400, "Этот тип файла не поддерживается")
+            if dst.exists():
+                raise HTTPException(409, "Такое имя уже существует")
+            temporary.rename(dst)
+        except Exception:
+            if temporary.is_dir():
+                shutil.rmtree(temporary)
+            else:
+                temporary.unlink(missing_ok=True)
+            raise
         return self._info(dst)
 
     def _trash_path(self, trash_id: str) -> Path:

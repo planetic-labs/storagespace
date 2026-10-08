@@ -12,7 +12,7 @@ services:
       - .env.auth
     environment:
       APP_DATA: /data
-      STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"},{"id":"prosvetlenie","name":"Просветление","path":"/storage/prosvetlenie","mode":"sshfs"}]'
+      STORAGES_JSON: '[{"id":"test","name":"Тест","path":"/storage/test","mode":"local"},{"id":"prosvetlenie","name":"Просветление","path":"/storage/prosvetlenie","mode":"sshfs"},{"id":"personal","name":"Персональное","path":"/storage/prosvetlenie","mode":"sshfs","personal_parent":"Users"}]'
     volumes:
       - app_data:/data
       - ./storage:/storage/test:rw

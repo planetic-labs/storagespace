@@ -26,6 +26,7 @@ ARK_ISSUER = os.getenv("ARK_ISSUER", "")
 SECRET = os.getenv("SESSION_SECRET", "")
 _jwk_client = jwt.PyJWKClient(ARK_JWKS_URL, cache_keys=True) if ARK_JWKS_URL else None
 _refresh_locks = {}
+personal_storage_ids: set[str] = set()
 
 
 @contextmanager
@@ -49,6 +50,8 @@ def initialize():
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, ark_sub TEXT NOT NULL UNIQUE,
           email TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
           ark_roles TEXT NOT NULL DEFAULT '[]');
+        CREATE TABLE IF NOT EXISTS personal_folder_settings(storage TEXT PRIMARY KEY,
+          path TEXT NOT NULL, label TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE, PRIMARY KEY(user_id,role_id));
         CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -66,6 +69,10 @@ def initialize():
         """)
         if "ark_roles" not in {r["name"] for r in db.execute("PRAGMA table_info(users)")}:
             db.execute("ALTER TABLE users ADD COLUMN ark_roles TEXT NOT NULL DEFAULT '[]'")
+        if "first_name" not in {r["name"] for r in db.execute("PRAGMA table_info(users)")}:
+            db.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
+        if "last_name" not in {r["name"] for r in db.execute("PRAGMA table_info(users)")}:
+            db.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
         for name, ark_name, system in (("Админ", "admin", 1), ("Воин", "warrior", 0), ("Ученик", "student", 0)):
             db.execute("INSERT OR IGNORE INTO roles(name,ark_name,system) VALUES(?,?,?)", (name, ark_name, system))
 
@@ -116,7 +123,31 @@ def _sync_roles(db, user_id, ark_roles):
             db.execute("INSERT INTO user_roles(user_id,role_id) VALUES(?,?)", (user_id, row["id"]))
 
 
-def login(claims, email, refresh_token):
+async def profile_name(access_token):
+    base = ARK_JWKS_URL.removesuffix("/.well-known/jwks.json")
+    if not base:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(base + "/api/v1/users/me",
+                                        headers={"Authorization": f"Bearer {access_token}"})
+            response.raise_for_status()
+            profile = response.json()
+        if not isinstance(profile, dict):
+            return None
+        return (str(profile.get("first_name") or "").strip()[:255],
+                str(profile.get("last_name") or "").strip()[:255])
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+
+
+def needs_profile(ark_sub):
+    with connection() as db:
+        row = db.execute("SELECT first_name,last_name FROM users WHERE ark_sub=?", (str(ark_sub),)).fetchone()
+    return row is None or not (row["first_name"] and row["last_name"])
+
+
+def login(claims, email, refresh_token, name=None):
     now = int(time.time())
     with connection() as db:
         row = db.execute("SELECT * FROM users WHERE ark_sub=?", (str(claims["sub"]),)).fetchone()
@@ -129,6 +160,10 @@ def login(claims, email, refresh_token):
         else:
             db.execute("UPDATE users SET email=?,ark_roles=? WHERE id=?",
                        (email, json.dumps(claims["roles"]), row["id"]))
+        if name:
+            db.execute("UPDATE users SET first_name=CASE WHEN first_name='' THEN ? ELSE first_name END,"
+                       "last_name=CASE WHEN last_name='' THEN ? ELSE last_name END WHERE id=?",
+                       (name[0], name[1], row["id"]))
         _sync_roles(db, row["id"], claims["roles"])
         token = secrets.token_urlsafe(32)
         encrypted = _cipher().encrypt(refresh_token.encode()).decode()
@@ -161,7 +196,7 @@ async def current_user(request: Request):
             await _refresh_session(hashed, user_id, row["ark_sub"], current["refresh_token"], now)
       _refresh_locks.pop(hashed, None)
     with connection() as db:
-        user = db.execute("SELECT id,ark_sub,email,active,ark_roles FROM users WHERE id=?", (user_id,)).fetchone()
+        user = db.execute("SELECT id,ark_sub,email,first_name,last_name,active,ark_roles FROM users WHERE id=?", (user_id,)).fetchone()
         if not user or not user["active"]:
             raise HTTPException(401, "Доступ отключён")
         _sync_roles(db, user_id, json.loads(user["ark_roles"]))
@@ -190,6 +225,8 @@ async def _refresh_session(hashed, user_id, ark_sub, encrypted_refresh, now):
 
 
 def permission(user, storage, path):
+    if storage in personal_storage_ids:
+        return 2
     if user["admin"]:
         return 2
     path = path.strip("/")

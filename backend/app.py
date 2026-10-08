@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
-from storage import MountedStorage, Storage
+from storage import MountedStorage, PersonalStorage, Storage
 import authz
 import admin
 import metadata
@@ -23,8 +23,10 @@ STORAGES: dict[str, Storage] = {
     x["id"]: MountedStorage(x["id"], x["name"], x["path"], x.get("mode", "local" if x.get("demo") else "sshfs"))
     for x in CONFIG
 }
+PERSONAL = {x["id"]: x["personal_parent"] for x in CONFIG if x.get("personal_parent") is not None}
 app = FastAPI(title="Storage Space prototype")
-admin.storage_ids = STORAGES
+admin.storage_ids = {key: value for key, value in STORAGES.items() if key not in PERSONAL}
+authz.personal_storage_ids = set(PERSONAL)
 app.include_router(admin.router)
 
 
@@ -60,6 +62,8 @@ def startup():
         """)
         if "directory" not in {row["name"] for row in db.execute("PRAGMA table_info(trash)")}:
             db.execute("ALTER TABLE trash ADD COLUMN directory INTEGER")
+        if "user_id" not in {row["name"] for row in db.execute("PRAGMA table_info(trash)")}:
+            db.execute("ALTER TABLE trash ADD COLUMN user_id INTEGER")
         if "user_id" not in {row["name"] for row in db.execute("PRAGMA table_info(uploads)")}:
             db.execute("ALTER TABLE uploads ADD COLUMN user_id INTEGER")
         audit_columns = {row["name"] for row in db.execute("PRAGMA table_info(audit)")}
@@ -90,10 +94,17 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def adapter(storage: str) -> Storage:
+def adapter(storage: str, request: Request) -> Storage:
     selected = STORAGES.get(storage)
     if not selected:
         raise HTTPException(404, "Хранилище не найдено")
+    if storage in PERSONAL:
+        cached = getattr(request.state, "personal_adapters", None)
+        if cached is None:
+            cached = request.state.personal_adapters = {}
+        if storage not in cached:
+            cached[storage] = PersonalStorage(selected, storage, selected.name, PERSONAL[storage], actor(request)["id"])
+        return cached[storage]
     return selected
 
 
@@ -111,8 +122,50 @@ def actor(request: Request):
     return request.state.user
 
 
+def data_path(storage: str, path: str, request: Request) -> str:
+    if storage in PERSONAL:
+        return f"user-{actor(request)['id']}" + ("/" + path if path else "")
+    return path
+
+
+def virtual_path(storage: str, path: str, request: Request) -> str:
+    if storage not in PERSONAL:
+        return path
+    prefix = f"user-{actor(request)['id']}/"
+    if not path.startswith(prefix):
+        raise HTTPException(404, "Файл не найден")
+    return path[len(prefix):]
+
+
+def data_entry(entry: dict, request: Request) -> dict:
+    return {**entry, "path": data_path(entry["storage"], entry["path"], request)}
+
+
+def user_folder_name(user) -> str:
+    return " ".join(filter(None, (user["last_name"], user["first_name"])))
+
+
+RUSSIAN_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+RUSSIAN_ORDER = {letter: index for index, letter in enumerate(RUSSIAN_ALPHABET)}
+
+
+def user_folder_sort_key(name: str):
+    return tuple((1, RUSSIAN_ORDER[letter]) if letter in RUSSIAN_ORDER else (0, ord(letter))
+                 for letter in name.casefold())
+
+
+def public_record(record: dict, request: Request) -> dict:
+    storage = record["storage"]
+    if storage not in PERSONAL:
+        return record
+    root = data_path(storage, "", request)
+    parent = record["parent"]
+    return {**record, "path": virtual_path(storage, record["path"], request),
+            "parent": "" if parent == root else virtual_path(storage, parent, request)}
+
+
 def check(request: Request, storage: str, path: str, level=1, traverse=False):
-    adapter(storage)
+    adapter(storage, request)
     authz.require(actor(request), storage, path, level, traverse)
 
 
@@ -138,7 +191,8 @@ async def login(body: LoginBody, response: Response):
     claims = authz.verify_ark(result.get("access_token"))
     if not result.get("refresh_token"):
         raise HTTPException(503, "Ark не выдал сессию")
-    token = authz.login(claims, body.email.strip().lower(), result["refresh_token"])
+    name = await authz.profile_name(result["access_token"]) if authz.needs_profile(claims["sub"]) else None
+    token = authz.login(claims, body.email.strip().lower(), result["refresh_token"], name)
     response.set_cookie(authz.COOKIE, token, max_age=authz.SESSION_DAYS * 86400,
                         httponly=True, secure=True, samesite="lax", path="/")
     return {"ok": True}
@@ -155,7 +209,8 @@ def logout(request: Request, response: Response):
 @app.get("/api/me")
 def me(request: Request):
     user = actor(request)
-    return {"id": user["id"], "email": user["email"], "admin": user["admin"], "roles": user["roles"]}
+    return {"id": user["id"], "email": user["email"], "first_name": user["first_name"],
+            "last_name": user["last_name"], "admin": user["admin"], "roles": user["roles"]}
 
 
 def audit(request: Request, operation: str, storage: str, path: str, target: str | None = None):
@@ -203,28 +258,64 @@ def storages(request: Request, fresh: bool = False):
 @app.get("/api/files")
 def files(request: Request, storage: str, path: str = "", search: str = ""):
     check(request, storage, path, traverse=True)
-    entries = adapter(storage).list_dir(path, search)
+    entries = adapter(storage, request).list_dir(path, search)
     with database() as db:
         known = {row["path"]: row["id"] for row in db.execute(
-            "SELECT path,id FROM file_metadata WHERE storage=? AND parent=? AND status='active'", (storage, path))}
+            "SELECT path,id FROM file_metadata WHERE storage=? AND parent=? AND status='active'",
+            (storage, data_path(storage, path, request)))}
         favorites = {(r["storage"], r["path"]) for r in db.execute("SELECT storage,path FROM user_favorites WHERE user_id=?", (actor(request)["id"],))}
+        setting = db.execute("SELECT path,label FROM personal_folder_settings WHERE storage=?", (storage,)).fetchone()
+        names = {}
+        if setting and path == setting["path"]:
+            names = {f"user-{row['id']}": user_folder_name(row)
+                     for row in db.execute("SELECT id,first_name,last_name FROM users")}
     entries = [entry for entry in entries if authz.can_traverse(actor(request), storage, entry["path"])]
     for entry in entries:
+        if entry["directory"] and setting:
+            if entry["path"] == setting["path"]:
+                entry["display_name"] = setting["label"]
+            elif path == setting["path"] and names.get(entry["name"]):
+                entry["display_name"] = names[entry["name"]]
         if not entry["directory"]:
-            entry["id"] = known.get(entry["path"])
+            entry["id"] = known.get(data_path(storage, entry["path"], request))
         entry["favorite"] = (storage, entry["path"]) in favorites
+    if setting and path == setting["path"]:
+        entries.sort(key=lambda entry: (not entry["directory"],
+                    user_folder_sort_key(entry.get("display_name") or entry["name"]),
+                    entry["name"]))
     return entries
+
+
+@app.get("/api/personal-folders")
+def personal_folder_labels(request: Request, storage: str, path: str = ""):
+    check(request, storage, path, traverse=True)
+    with database() as db:
+        setting = db.execute("SELECT path,label FROM personal_folder_settings WHERE storage=?", (storage,)).fetchone()
+        if not setting:
+            return {}
+        labels = {setting["path"]: setting["label"]}
+        prefix = setting["path"] + "/user-"
+        if path.startswith(prefix):
+            user_id = path[len(prefix):].split("/", 1)[0]
+            if user_id.isdecimal():
+                row = db.execute("SELECT first_name,last_name FROM users WHERE id=?", (int(user_id),)).fetchone()
+                if row:
+                    name = user_folder_name(row)
+                    if name:
+                        labels[prefix + user_id] = name
+        return labels
 
 
 @app.post("/api/files/resolve")
 def resolve_file(body: PathBody, request: Request):
     check(request, body.storage, body.path)
-    entry = adapter(body.storage).info(body.path)
+    entry = adapter(body.storage, request).info(body.path)
     if entry["directory"]:
         raise HTTPException(400, "Выберите файл")
     with database() as db:
-        file_id = metadata.observe(db, entry)
-        return metadata.get(db, file_id)
+        file_id = metadata.observe(db, data_entry(entry, request))
+        record = metadata.get(db, file_id)
+        return public_record(record, request)
 
 
 def file_record(request: Request, file_id: str) -> dict:
@@ -232,9 +323,10 @@ def file_record(request: Request, file_id: str) -> dict:
         record = metadata.get(db, file_id)
     if not record or record["status"] != "active":
         raise HTTPException(404, "Файл не найден")
-    check(request, record["storage"], record["path"])
+    path = virtual_path(record["storage"], record["path"], request)
+    check(request, record["storage"], path)
     try:
-        entry = adapter(record["storage"]).info(record["path"])
+        entry = adapter(record["storage"], request).info(path)
     except HTTPException as error:
         if error.status_code == 404:
             with database() as db:
@@ -245,19 +337,20 @@ def file_record(request: Request, file_id: str) -> dict:
             metadata.set_status(db, record["storage"], record["path"], "missing")
         raise HTTPException(404, "Файл не найден")
     with database() as db:
-        metadata.observe(db, entry)
+        metadata.observe(db, data_entry(entry, request))
         return metadata.get(db, file_id)
 
 
 @app.get("/api/files/{file_id}")
 def file_metadata(file_id: str, request: Request):
-    return file_record(request, file_id)
+    record = file_record(request, file_id)
+    return public_record(record, request)
 
 
 @app.get("/api/files/{file_id}/content")
 def file_content(file_id: str, request: Request, download: bool = False):
     record = file_record(request, file_id)
-    return adapter(record["storage"]).serve(record["path"], inline=not download)
+    return adapter(record["storage"], request).serve(virtual_path(record["storage"], record["path"], request), inline=not download)
 
 
 @app.post("/api/files/{file_id}/sha256")
@@ -269,35 +362,37 @@ def calculate_sha256(file_id: str, request: Request):
     except RuntimeError as error:
         raise HTTPException(429, str(error)) from None
     if queued:
-        metadata.start_hash(record, adapter(record["storage"]))
+        metadata.start_hash(record, adapter(record["storage"], request),
+                            virtual_path(record["storage"], record["path"], request))
     with database() as db:
-        return metadata.get(db, file_id)
+        updated = metadata.get(db, file_id)
+        return public_record(updated, request)
 
 
 @app.get("/api/download")
 def download(request: Request, storage: str, path: str):
     check(request, storage, path)
-    entry = adapter(storage).info(path)
+    entry = adapter(storage, request).info(path)
     if not entry["directory"]:
         with database() as db:
-            metadata.observe(db, entry)
-    return adapter(storage).serve(path, inline=False)
+            metadata.observe(db, data_entry(entry, request))
+    return adapter(storage, request).serve(path, inline=False)
 
 
 @app.get("/api/preview")
 def preview(request: Request, storage: str, path: str):
     check(request, storage, path)
-    entry = adapter(storage).info(path)
+    entry = adapter(storage, request).info(path)
     if not entry["directory"]:
         with database() as db:
-            metadata.observe(db, entry)
-    return adapter(storage).serve(path, inline=True)
+            metadata.observe(db, data_entry(entry, request))
+    return adapter(storage, request).serve(path, inline=True)
 
 
 @app.post("/api/folders")
 def mkdir(body: PathBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
-    result = adapter(body.storage).mkdir(body.path)
+    result = adapter(body.storage, request).mkdir(body.path)
     audit(request, "mkdir", body.storage, body.path)
     return result
 
@@ -306,7 +401,7 @@ def mkdir(body: PathBody, request: Request):
 def ensure_folders(body: EnsureFoldersBody, request: Request):
     if len(body.paths) > 1000:
         raise HTTPException(400, "Слишком много папок в одной части запроса")
-    selected = adapter(body.storage)
+    selected = adapter(body.storage, request)
     created = 0
     for path in sorted(set(body.paths), key=lambda value: (value.count("/"), value)):
         if not path:
@@ -330,7 +425,7 @@ def start_upload(body: UploadBody, request: Request):
     if body.size < 0 or body.size > 1024**4:
         raise HTTPException(400, "Некорректный размер файла")
     upload_id = uuid.uuid4().hex
-    selected = adapter(body.storage)
+    selected = adapter(body.storage, request)
     if selected.exists(body.path):
         raise HTTPException(409, "Такое имя уже существует")
     selected.create_upload(upload_id, body.path)
@@ -355,7 +450,7 @@ def upload_row(upload_id: str, request: Request):
 def upload_status(upload_id: str, request: Request):
     row = upload_row(upload_id, request)
     return {"id": upload_id, "storage": row["storage"], "path": row["path"],
-            "size": row["size"], "offset": adapter(row["storage"]).upload_offset(upload_id)}
+            "size": row["size"], "offset": adapter(row["storage"], request).upload_offset(upload_id)}
 
 
 @app.patch("/api/uploads/{upload_id}")
@@ -368,7 +463,7 @@ async def upload_part(upload_id: str, request: Request):
     if offset < 0:
         raise HTTPException(400, "Некорректное смещение")
     try:
-        new_offset = await adapter(row["storage"]).append_upload(upload_id, offset, row["size"], request.stream())
+        new_offset = await adapter(row["storage"], request).append_upload(upload_id, offset, row["size"], request.stream())
     except ClientDisconnect:
         raise HTTPException(499, "Клиент прервал передачу") from None
     return {"offset": new_offset}
@@ -383,10 +478,10 @@ def complete_upload(upload_id: str, request: Request, body: CompleteUploadBody |
             raise HTTPException(400, "Некорректное имя файла")
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
         path = "/".join(x for x in (parent, body.filename) if x)
-    result = adapter(row["storage"]).finish_upload(upload_id, path, row["size"])
+    result = adapter(row["storage"], request).finish_upload(upload_id, path, row["size"])
     with database() as db:
         db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
-        metadata.observe(db, result)
+        metadata.observe(db, data_entry(result, request))
     audit(request, "upload", row["storage"], path)
     return result
 
@@ -394,7 +489,7 @@ def complete_upload(upload_id: str, request: Request, body: CompleteUploadBody |
 @app.delete("/api/uploads/{upload_id}")
 def cancel_upload(upload_id: str, request: Request):
     row = upload_row(upload_id, request)
-    adapter(row["storage"]).abort_upload(upload_id)
+    adapter(row["storage"], request).abort_upload(upload_id)
     with database() as db:
         db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
     audit(request, "upload_cancel", row["storage"], row["path"])
@@ -405,32 +500,51 @@ def cancel_upload(upload_id: str, request: Request):
 def move(body: MoveBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
     check(request, body.storage, body.target.rsplit("/", 1)[0] if "/" in body.target else "", 2)
-    source_info = adapter(body.storage).info(body.path)
+    source_info = adapter(body.storage, request).info(body.path)
     directory = source_info["directory"]
     if not directory:
         with database() as db:
-            metadata.observe(db, source_info)
-    result = adapter(body.storage).move(body.path, body.target)
+            metadata.observe(db, data_entry(source_info, request))
+    result = adapter(body.storage, request).move(body.path, body.target)
     with database() as db:
-        metadata.move_path(db, body.storage, body.path, body.target)
+        metadata.move_path(db, body.storage, data_path(body.storage, body.path, request),
+                           data_path(body.storage, body.target, request))
         db.execute("""UPDATE user_favorites
                       SET path=? || substr(path, length(?) + 1)
-                      WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')""",
-                   (body.target, body.path, body.storage, body.path, body.path, body.path))
+                      WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')
+                      AND (?=0 OR user_id=?)""",
+                   (body.target, body.path, body.storage, body.path, body.path, body.path,
+                    int(body.storage in PERSONAL), actor(request)["id"]))
         if directory:
             db.execute("""UPDATE grants SET path=? || substr(path, length(?) + 1)
+                          WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')""",
+                       (body.target, body.path, body.storage, body.path, body.path, body.path))
+            db.execute("""UPDATE personal_folder_settings
+                          SET path=? || substr(path, length(?) + 1)
                           WHERE storage=? AND (path=? OR substr(path, 1, length(?) + 1)=? || '/')""",
                        (body.target, body.path, body.storage, body.path, body.path, body.path))
     audit(request, "move", body.storage, body.path, body.target)
     return result
 
 
+@app.post("/api/copy")
+def copy(body: MoveBody, request: Request):
+    check(request, body.storage, body.path)
+    check(request, body.storage, body.target.rsplit("/", 1)[0] if "/" in body.target else "", 2)
+    result = adapter(body.storage, request).copy(body.path, body.target)
+    if not result["directory"]:
+        with database() as db:
+            metadata.observe(db, data_entry(result, request))
+    audit(request, "copy", body.storage, body.path, body.target)
+    return result
+
+
 @app.post("/api/favorite")
 def favorite(body: PathBody, request: Request):
     check(request, body.storage, body.path)
-    entry = adapter(body.storage).info(body.path)
+    entry = adapter(body.storage, request).info(body.path)
     with database() as db:
-        metadata.observe(db, entry)
+        metadata.observe(db, data_entry(entry, request))
         exists = db.execute("SELECT 1 FROM user_favorites WHERE user_id=? AND storage=? AND path=?", (actor(request)["id"], body.storage, body.path)).fetchone()
         if exists:
             db.execute("DELETE FROM user_favorites WHERE user_id=? AND storage=? AND path=?", (actor(request)["id"], body.storage, body.path))
@@ -442,16 +556,31 @@ def favorite(body: PathBody, request: Request):
 @app.get("/api/favorites")
 def favorites(request: Request):
     with database() as db:
-        rows = list(db.execute("""SELECT f.storage,f.path,m.id FROM user_favorites f
-                  LEFT JOIN file_metadata m ON m.storage=f.storage AND m.path=f.path AND m.status='active'
-                  WHERE f.user_id=? ORDER BY f.path""", (actor(request)["id"],)))
+        personal_ids = tuple(PERSONAL)
+        personal_clause = "f.storage IN (" + ",".join("?" for _ in personal_ids) + ")" if personal_ids else "0"
+        rows = list(db.execute(f"""SELECT f.storage,f.path,m.id FROM user_favorites f
+                  LEFT JOIN file_metadata m ON m.storage=f.storage AND m.path=
+                    CASE WHEN {personal_clause} THEN 'user-' || f.user_id || '/' || f.path ELSE f.path END
+                    AND m.status='active'
+                  WHERE f.user_id=? ORDER BY f.path""", (*personal_ids, actor(request)["id"])))
+        settings = {r["storage"]: r for r in db.execute("SELECT storage,path,label FROM personal_folder_settings")}
+        users = {r["id"]: user_folder_name(r)
+                 for r in db.execute("SELECT id,first_name,last_name FROM users")}
     result = []
     for row in rows:
         if not authz.permission(actor(request), row["storage"], row["path"]):
             continue
         try:
-            entry = adapter(row["storage"]).info(row["path"])
+            entry = adapter(row["storage"], request).info(row["path"])
             entry["id"] = row["id"]
+            setting = settings.get(row["storage"])
+            if entry["directory"] and setting:
+                if entry["path"] == setting["path"]:
+                    entry["display_name"] = setting["label"]
+                elif entry["path"].startswith(setting["path"] + "/user-"):
+                    suffix = entry["path"][len(setting["path"]) + 6:]
+                    if suffix.isdecimal() and users.get(int(suffix)):
+                        entry["display_name"] = users[int(suffix)]
             result.append({**entry, "favorite": True})
         except HTTPException:
             pass
@@ -462,11 +591,11 @@ def favorites(request: Request):
 def trash(body: PathBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
     trash_id = uuid.uuid4().hex
-    selected = adapter(body.storage)
+    selected = adapter(body.storage, request)
     directory = selected.is_dir(body.path)
     if not directory:
         with database() as db:
-            metadata.observe(db, selected.info(body.path))
+            metadata.observe(db, data_entry(selected.info(body.path), request))
     if directory:
         with database() as db:
             grant = db.execute("""SELECT 1 FROM grants WHERE storage=? AND
@@ -476,10 +605,11 @@ def trash(body: PathBody, request: Request):
             raise HTTPException(409, "Сначала уберите права доступа к этой папке и вложенным папкам")
     selected.trash(body.path, trash_id)
     with database() as db:
-        metadata.set_status(db, body.storage, body.path, "trashed")
-        db.execute("INSERT INTO trash(id,storage,original_path,trashed_path,deleted_at,directory) VALUES(?,?,?,?,?,?)",
-                   (trash_id, body.storage, body.path, trash_id, now(), int(directory)))
-        db.execute("DELETE FROM user_favorites WHERE storage=? AND (path=? OR path LIKE ?)", (body.storage, body.path, body.path + "/%"))
+        metadata.set_status(db, body.storage, data_path(body.storage, body.path, request), "trashed")
+        db.execute("INSERT INTO trash(id,storage,original_path,trashed_path,deleted_at,directory,user_id) VALUES(?,?,?,?,?,?,?)",
+                   (trash_id, body.storage, body.path, trash_id, now(), int(directory), actor(request)["id"]))
+        db.execute("DELETE FROM user_favorites WHERE storage=? AND (path=? OR path LIKE ?) AND (?=0 OR user_id=?)",
+                   (body.storage, body.path, body.path + "/%", int(body.storage in PERSONAL), actor(request)["id"]))
     audit(request, "trash", body.storage, body.path)
     return {"id": trash_id}
 
@@ -487,12 +617,13 @@ def trash(body: PathBody, request: Request):
 @app.get("/api/trash")
 def trash_list(request: Request):
     with database() as db:
-        rows = [dict(row) for row in db.execute("SELECT id,storage,original_path,deleted_at,directory FROM trash ORDER BY deleted_at DESC")]
-    rows = [row for row in rows if authz.permission(actor(request), row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "")]
+        rows = [dict(row) for row in db.execute("SELECT id,storage,original_path,deleted_at,directory,user_id FROM trash ORDER BY deleted_at DESC")]
+    rows = [row for row in rows if (row["storage"] not in PERSONAL or row["user_id"] == actor(request)["id"])
+            and authz.permission(actor(request), row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "")]
     for row in rows:
         if row["directory"] is None:
             try:
-                row["directory"] = int(adapter(row["storage"]).trash_is_dir(row["id"]))
+                row["directory"] = int(adapter(row["storage"], request).trash_is_dir(row["id"]))
             except HTTPException:
                 row["directory"] = 0
         row["directory"] = bool(row["directory"])
@@ -501,28 +632,28 @@ def trash_list(request: Request):
 
 @app.get("/api/trash/{trash_id}/files")
 def trash_files(trash_id: str, request: Request, path: str = ""):
-    row = trash_row(trash_id)
+    row = trash_row(trash_id, request)
     check(request, row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "")
-    entries = adapter(row["storage"]).list_trashed(trash_id, path)
+    entries = adapter(row["storage"], request).list_trashed(trash_id, path)
     return [{**entry, "path": row["original_path"] + "/" + entry["path"],
              "trash_path": entry["path"], "trash_id": trash_id} for entry in entries]
 
 
-def trash_row(trash_id: str):
+def trash_row(trash_id: str, request: Request):
     with database() as db:
         row = db.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
-    if not row:
+    if not row or (row["storage"] in PERSONAL and row["user_id"] != actor(request)["id"]):
         raise HTTPException(404, "Не найдено в корзине")
     return row
 
 
 @app.post("/api/trash/{trash_id}/restore")
 def restore(trash_id: str, request: Request):
-    row = trash_row(trash_id)
+    row = trash_row(trash_id, request)
     check(request, row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "", 2)
-    adapter(row["storage"]).restore(trash_id, row["original_path"])
+    adapter(row["storage"], request).restore(trash_id, row["original_path"])
     with database() as db:
-        metadata.set_status(db, row["storage"], row["original_path"], "active")
+        metadata.set_status(db, row["storage"], data_path(row["storage"], row["original_path"], request), "active")
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
     audit(request, "restore", row["storage"], row["original_path"])
     return {"ok": True}
@@ -530,11 +661,11 @@ def restore(trash_id: str, request: Request):
 
 @app.delete("/api/trash/{trash_id}")
 def delete_forever(trash_id: str, request: Request):
-    row = trash_row(trash_id)
+    row = trash_row(trash_id, request)
     check(request, row["storage"], row["original_path"].rsplit("/",1)[0] if "/" in row["original_path"] else "", 2)
-    adapter(row["storage"]).purge(trash_id)
+    adapter(row["storage"], request).purge(trash_id)
     with database() as db:
-        metadata.set_status(db, row["storage"], row["original_path"], "missing")
+        metadata.set_status(db, row["storage"], data_path(row["storage"], row["original_path"], request), "missing")
         db.execute("DELETE FROM trash WHERE id=?", (trash_id,))
     audit(request, "delete_forever", row["storage"], row["original_path"])
     return {"ok": True}

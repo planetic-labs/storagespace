@@ -46,6 +46,12 @@ class GrantBody(BaseModel):
     level: int
 
 
+class PersonalFolderBody(BaseModel):
+    storage: str
+    path: str
+    label: str = Field(min_length=1, max_length=80)
+
+
 @router.get("/overview")
 def overview(request: Request):
     administrator(request)
@@ -56,9 +62,36 @@ def overview(request: Request):
         members = [dict(r) for r in db.execute("SELECT * FROM group_members")]
         grants = [dict(r) for r in db.execute("SELECT * FROM grants ORDER BY storage,path")]
         user_roles = [dict(r) for r in db.execute("SELECT * FROM user_roles")]
+        personal_folders = [dict(r) for r in db.execute("SELECT storage,path,label FROM personal_folder_settings")]
     return {"roles": roles, "users": users, "groups": groups, "members": members,
-            "grants": grants, "user_roles": user_roles,
+            "grants": grants, "user_roles": user_roles, "personal_folders": personal_folders,
             "storages": [{"id": key, "name": value.name} for key, value in storage_ids.items()]}
+
+
+@router.put("/personal-folders")
+def save_personal_folder(body: PersonalFolderBody, request: Request):
+    administrator(request)
+    selected = storage_ids.get(body.storage)
+    if not selected:
+        raise HTTPException(404, "Хранилище не найдено")
+    path, label = body.path.strip("/"), body.label.strip()
+    if not path or not label or "\\" in path or any(part in ("", ".", "..") or part.startswith(".") for part in path.split("/")):
+        raise HTTPException(400, "Некорректная папка или название")
+    if not selected.is_dir(path):
+        raise HTTPException(404, "Папка не найдена")
+    with authz.connection() as db:
+        db.execute("INSERT INTO personal_folder_settings(storage,path,label) VALUES(?,?,?) "
+                   "ON CONFLICT(storage) DO UPDATE SET path=excluded.path,label=excluded.label",
+                   (body.storage, path, label))
+    return {"ok": True}
+
+
+@router.delete("/personal-folders/{storage}")
+def delete_personal_folder(storage: str, request: Request):
+    administrator(request)
+    with authz.connection() as db:
+        db.execute("DELETE FROM personal_folder_settings WHERE storage=?", (storage,))
+    return {"ok": True}
 
 
 @router.get("/audit")

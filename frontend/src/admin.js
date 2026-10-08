@@ -33,7 +33,12 @@ export async function openAdmin() {
       <div class="admin-members">${data.members.map(m=>`<div><span>${esc(nameOf('user',m.user_id))} · ${esc(nameOf('group',m.group_id))}</span><button data-remove-member="${m.group_id}:${m.user_id}" aria-label="Убрать из группы">×</button></div>`).join('')}</div>`
   }
   function renderUsers(){
-    return `<div class="admin-section-head"><div><h2>Пользователи</h2><p>Пользователь появляется после первого входа через Ark. Отключение и отзыв сессий действуют сразу.</p></div></div><div class="admin-list">${data.users.map(user=>`<div class="admin-list-row"><div><strong>${esc(user.email)}</strong><small>ID ${user.id} · ${data.user_roles.filter(item=>item.user_id===user.id).map(item=>nameOf('role',item.role_id)).filter(Boolean).map(esc).join(', ')||'Нет сопоставленной роли'} · ${user.active?'Активен':'Отключён'}</small></div><button class="soft-button" data-revoke="${user.id}">Завершить сессии</button><button class="admin-text-button ${user.active?'danger':''}" data-toggle-user="${user.id}" ${user.id===data.self_id?'disabled':''}>${user.active?'Отключить':'Включить'}</button></div>`).join('')||'<p class="admin-empty">Пользователей пока нет.</p>'}</div>`
+    return `<div class="admin-section-head"><div><h2>Пользователи</h2><p>Пользователь появляется после первого входа через Ark. Отключение и отзыв сессий действуют сразу.</p></div></div><div class="admin-list">${data.users.map(user=>`<div class="admin-list-row"><div><strong>${esc([user.first_name,user.last_name].filter(Boolean).join(' ')||user.email)}</strong><small>${esc(user.email)} · ID ${user.id} · ${data.user_roles.filter(item=>item.user_id===user.id).map(item=>nameOf('role',item.role_id)).filter(Boolean).map(esc).join(', ')||'Нет сопоставленной роли'} · ${user.active?'Активен':'Отключён'}</small></div><button class="soft-button" data-revoke="${user.id}">Завершить сессии</button><button class="admin-text-button ${user.active?'danger':''}" data-toggle-user="${user.id}" ${user.id===data.self_id?'disabled':''}>${user.active?'Отключить':'Включить'}</button></div>`).join('')||'<p class="admin-empty">Пользователей пока нет.</p>'}</div>`
+  }
+  function renderPersonalFolders(){
+    return `<div class="admin-section-head"><div><h2>Персональные папки</h2><p>Выберите существующую папку. Её прямые подпапки с именами user-ID будут показаны по имени пользователя из Ark. Названия на диске и права доступа не меняются.</p></div></div>
+      <div class="admin-list">${data.personal_folders.map(item=>`<div class="admin-list-row"><div><strong>${esc(item.label)}</strong><small>${esc(data.storages.find(x=>x.id===item.storage)?.name||item.storage)} / ${esc(item.path)}</small></div><button class="admin-text-button danger" data-delete-personal="${esc(item.storage)}">Убрать</button></div>`).join('')||'<p class="admin-empty">Настроенных папок пока нет.</p>'}</div>
+      <form class="admin-form" id="personalForm"><h3>Настроить папку</h3><label class="admin-field">Хранилище<select name="storage">${options(data.storages)}</select></label>${field('Путь к существующей папке','path','','required placeholder="Например, Users"')}${field('Название в интерфейсе','label','','required maxlength="80" placeholder="Например, Пользовательские"')}<button class="primary-button">Сохранить</button></form>`
   }
   function renderAccess(){
     const subjects=[...data.roles.map(x=>({id:'role:'+x.id,name:'Роль · '+x.name})),...data.groups.map(x=>({id:'group:'+x.id,name:'Группа · '+x.name})),...data.users.map(x=>({id:'user:'+x.id,name:'Пользователь · '+x.email}))]
@@ -42,14 +47,14 @@ export async function openAdmin() {
       <form class="admin-form" id="grantForm"><h3>Выдать доступ</h3><label class="admin-field">Кому<select name="subject">${options(subjects)}</select></label><label class="admin-field">Хранилище<select name="storage">${options(data.storages)}</select></label>${field('Путь к папке (пусто — всё хранилище)','path','','placeholder="Например, Проекты/2026"')}<label class="admin-field">Уровень<select name="level"><option value="1">Просмотр и скачивание</option><option value="2">Изменение файлов</option></select></label><button class="primary-button">Выдать доступ</button></form>`
   }
   function renderAudit(){
-    const names={mkdir:'Новая папка',upload:'Загрузка',upload_cancel:'Отмена загрузки',move:'Перемещение',trash:'В корзину',restore:'Восстановление',delete_forever:'Удаление навсегда'}
+    const names={mkdir:'Новая папка',upload:'Загрузка',upload_cancel:'Отмена загрузки',move:'Перемещение',copy:'Копирование',trash:'В корзину',restore:'Восстановление',delete_forever:'Удаление навсегда'}
     return `<div class="admin-section-head"><div><h2>Журнал изменений файлов</h2><p>Записываются завершённые операции изменения. Просмотры и скачивания сюда не входят.</p></div></div>
       <div class="admin-list">${auditPage?.items?.map(item=>`<div class="admin-list-row"><div><strong>${esc(names[item.operation]||item.operation)} · ${esc(item.path)}</strong><small>${esc(new Date(item.at).toLocaleString('ru-RU'))} · ${esc(item.user_email||'Пользователь не указан')} · ${esc(data.storages.find(s=>s.id===item.storage)?.name||item.storage)}${item.target?' → '+esc(item.target):''}</small></div></div>`).join('')||'<p class="admin-empty">Записей пока нет.</p>'}</div>
       ${auditPage?.next_before?'<button class="soft-button admin-more" data-more-audit>Показать ещё</button>':''}`
   }
   function render(){
     data.self_id=data.self_id||window.storageSpaceUser?.id
-    shell.innerHTML=`<header class="admin-header"><div><span>Storage Space</span><h1>Администрирование</h1></div><button class="admin-close" aria-label="Закрыть администрирование">×</button></header><nav class="admin-tabs">${[['access','Доступ'],['users','Пользователи'],['roles','Роли'],['groups','Группы'],['audit','Журнал']].map(([key,label])=>`<button data-admin-tab="${key}" class="${tab===key?'active':''}">${label}</button>`).join('')}</nav><div class="admin-content"><p class="admin-message" hidden></p>${tab==='roles'?renderRoles():tab==='groups'?renderGroups():tab==='users'?renderUsers():tab==='audit'?renderAudit():renderAccess()}</div>`
+    shell.innerHTML=`<header class="admin-header"><div><span>Storage Space</span><h1>Администрирование</h1></div><button class="admin-close" aria-label="Закрыть администрирование">×</button></header><nav class="admin-tabs">${[['access','Доступ'],['personal','Папки'],['users','Пользователи'],['roles','Роли'],['groups','Группы'],['audit','Журнал']].map(([key,label])=>`<button data-admin-tab="${key}" class="${tab===key?'active':''}">${label}</button>`).join('')}</nav><div class="admin-content"><p class="admin-message" hidden></p>${tab==='roles'?renderRoles():tab==='groups'?renderGroups():tab==='users'?renderUsers():tab==='personal'?renderPersonalFolders():tab==='audit'?renderAudit():renderAccess()}</div>`
   }
   panel.addEventListener('click',event=>{
     const target=event.target.closest('button')
@@ -63,6 +68,7 @@ export async function openAdmin() {
     if(target.dataset.deleteRole){if(confirm('Удалить роль и все выданные ей права?'))run(()=>request('/roles/'+target.dataset.deleteRole,'DELETE'));return}
     if(target.dataset.deleteGroup){if(confirm('Удалить группу и все её права?'))run(()=>request('/groups/'+target.dataset.deleteGroup,'DELETE'));return}
     if(target.dataset.deleteGrant){run(()=>request('/grants/'+target.dataset.deleteGrant,'DELETE'));return}
+    if(target.dataset.deletePersonal){run(()=>request('/personal-folders/'+encodeURIComponent(target.dataset.deletePersonal),'DELETE'));return}
     if(target.dataset.removeMember){const [group,user]=target.dataset.removeMember.split(':');run(()=>request(`/groups/${group}/members/${user}`,'DELETE'));return}
     if(target.dataset.revoke){if(confirm('Завершить все активные сессии пользователя?'))run(()=>request('/users/'+target.dataset.revoke+'/revoke','POST'));return}
     if(target.dataset.toggleUser){const user=data.users.find(x=>x.id===Number(target.dataset.toggleUser));if(confirm(user.active?'Отключить доступ пользователя?':'Включить доступ пользователя?'))run(()=>request('/users/'+user.id,'PUT',{active:!user.active}));return}
@@ -74,6 +80,7 @@ export async function openAdmin() {
     if(form.id==='groupForm')run(async()=>{await request(editingGroup?'/groups/'+editingGroup.id:'/groups',editingGroup?'PUT':'POST',values);editingGroup=null})
     if(form.id==='memberForm')run(()=>request('/groups/'+values.group_id+'/members','POST',{user_id:Number(values.user_id)}))
     if(form.id==='grantForm'){const [subject_type,subject_id]=values.subject.split(':');run(()=>request('/grants','POST',{subject_type,subject_id:Number(subject_id),storage:values.storage,path:values.path.trim(),level:Number(values.level)}))}
+    if(form.id==='personalForm')run(()=>request('/personal-folders','PUT',{storage:values.storage,path:values.path.trim(),label:values.label.trim()}))
   })
   try{data=await request('/overview');render()}catch(error){shell.innerHTML=`<div class="admin-loading">${esc(error.message)} <button class="soft-button admin-close">Закрыть</button></div>`}
 }

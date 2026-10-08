@@ -92,21 +92,21 @@ def queue_hash(db: sqlite3.Connection, record: dict) -> bool:
     return changed.rowcount == 1
 
 
-def start_hash(record: dict, storage) -> None:
-    HASH_WORKER.submit(_calculate_hash, record["id"], record["path"], storage)
+def start_hash(record: dict, storage, io_path: str | None = None) -> None:
+    HASH_WORKER.submit(_calculate_hash, record["id"], record["path"], io_path or record["path"], storage)
 
 
-def _calculate_hash(file_id: str, path: str, storage) -> None:
+def _calculate_hash(file_id: str, path: str, io_path: str, storage) -> None:
     try:
         with sqlite3.connect(DB, timeout=30) as db:
             db.execute("UPDATE file_metadata SET hash_status='running' WHERE id=? AND path=? AND hash_status='queued'",
                        (file_id, path))
-        before = storage.info(path)
+        before = storage.info(io_path)
         digest = hashlib.sha256()
-        with storage.open_for_hash(path) as source:
+        with storage.open_for_hash(io_path) as source:
             for chunk in iter(lambda: source.read(4 * 1024 * 1024), b""):
                 digest.update(chunk)
-        after = storage.info(path)
+        after = storage.info(io_path)
         valid = before["size"] == after["size"] and before["mtime_ns"] == after["mtime_ns"]
         with sqlite3.connect(DB, timeout=30) as db:
             db.execute("""UPDATE file_metadata SET sha256=?,hash_status=? WHERE id=? AND path=?
