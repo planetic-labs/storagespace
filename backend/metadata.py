@@ -52,20 +52,6 @@ def observe(db: sqlite3.Connection, entry: dict) -> str | None:
     return file_id
 
 
-def sync_directory(db: sqlite3.Connection, storage: str, parent: str, entries: list[dict]) -> None:
-    seen = set()
-    for entry in entries:
-        file_id = observe(db, entry)
-        if file_id:
-            entry["id"] = file_id
-            seen.add(entry["path"])
-    for row in list(db.execute("SELECT id,path FROM file_metadata WHERE storage=? AND parent=? AND status='active'",
-                               (storage, parent))):
-        if row["path"] not in seen:
-            db.execute("UPDATE file_metadata SET status='missing',sha256=NULL,hash_status='not_computed' WHERE id=?",
-                       (row["id"],))
-
-
 def move_path(db: sqlite3.Connection, storage: str, source: str, target: str) -> None:
     rows = list(db.execute("""SELECT id,path FROM file_metadata WHERE storage=? AND status='active'
                               AND (path=? OR substr(path,1,length(?)+1)=? || '/')""",
@@ -101,8 +87,9 @@ def queue_hash(db: sqlite3.Connection, record: dict) -> bool:
     pending = db.execute("SELECT COUNT(*) FROM file_metadata WHERE hash_status IN ('queued','running')").fetchone()[0]
     if pending >= 10:
         raise RuntimeError("Очередь расчёта хешей заполнена")
-    db.execute("UPDATE file_metadata SET hash_status='queued' WHERE id=?", (record["id"],))
-    return True
+    changed = db.execute("""UPDATE file_metadata SET hash_status='queued' WHERE id=? AND status='active'
+                            AND hash_status NOT IN ('queued','running','ready')""", (record["id"],))
+    return changed.rowcount == 1
 
 
 def start_hash(record: dict, storage) -> None:

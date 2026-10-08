@@ -5,6 +5,7 @@ RUN npm install
 COPY index.html ./
 COPY vite.config.js ./
 COPY src ./src
+COPY public ./public
 RUN npm run build
 FROM nginx:alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf

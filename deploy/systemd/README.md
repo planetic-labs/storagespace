@@ -1,7 +1,7 @@
 # Проверка монтирований Storage Space
 
-На S4 проверка запускается ежеминутно из crontab пользователя `devman`.
-Системные unit-файлы остаются альтернативой; они не установлены.
+Проверку можно запускать ежеминутно из crontab пользователя с доступом к Docker.
+Системные unit-файлы служат альтернативой.
 
 В `mounts.conf` перечисляются удалённые файловые системы. Каждая строка содержит
 три поля через пробел: абсолютный путь монтирования на хосте, путь в контейнере
@@ -17,7 +17,7 @@ backend и фактический тип файловой системы (`fuse.
 пересоздаётся **один раз**. Активная передача при этом прервётся; загрузку
 можно продолжить повторным выбором файла.
 
-Скрипт работает от `devman` с доступом к группе `docker`. Общий Docker и
+Скрипт работает от пользователя с доступом к группе `docker`. Общий Docker и
 другие проекты он не меняет.
 
 Безопасная проверка логики без пересоздания контейнера:
@@ -29,7 +29,7 @@ bash deploy/systemd/check-sshfs-bind.sh --dry-run
 Если понадобится заменить cron на системный таймер:
 
 ```sh
-cd /home/devman/workspace/storagespace
+cd /path/to/storagespace
 sudo install -m 0644 deploy/systemd/storagespace-sshfs-check.service /etc/systemd/system/
 sudo install -m 0644 deploy/systemd/storagespace-sshfs-check.timer /etc/systemd/system/
 sudo systemctl daemon-reload

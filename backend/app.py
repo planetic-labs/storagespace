@@ -177,6 +177,11 @@ class PathBody(BaseModel):
     path: str
 
 
+class EnsureFoldersBody(BaseModel):
+    storage: str
+    paths: list[str]
+
+
 class MoveBody(PathBody):
     target: str
 
@@ -198,15 +203,28 @@ def storages(request: Request, fresh: bool = False):
 @app.get("/api/files")
 def files(request: Request, storage: str, path: str = "", search: str = ""):
     check(request, storage, path, traverse=True)
-    entries = adapter(storage).list_dir(path)
+    entries = adapter(storage).list_dir(path, search)
     with database() as db:
-        metadata.sync_directory(db, storage, path, entries)
+        known = {row["path"]: row["id"] for row in db.execute(
+            "SELECT path,id FROM file_metadata WHERE storage=? AND parent=? AND status='active'", (storage, path))}
         favorites = {(r["storage"], r["path"]) for r in db.execute("SELECT storage,path FROM user_favorites WHERE user_id=?", (actor(request)["id"],))}
-    entries = [entry for entry in entries if search.casefold() in entry["name"].casefold()
-               and authz.can_traverse(actor(request), storage, entry["path"])]
+    entries = [entry for entry in entries if authz.can_traverse(actor(request), storage, entry["path"])]
     for entry in entries:
+        if not entry["directory"]:
+            entry["id"] = known.get(entry["path"])
         entry["favorite"] = (storage, entry["path"]) in favorites
     return entries
+
+
+@app.post("/api/files/resolve")
+def resolve_file(body: PathBody, request: Request):
+    check(request, body.storage, body.path)
+    entry = adapter(body.storage).info(body.path)
+    if entry["directory"]:
+        raise HTTPException(400, "Выберите файл")
+    with database() as db:
+        file_id = metadata.observe(db, entry)
+        return metadata.get(db, file_id)
 
 
 def file_record(request: Request, file_id: str) -> dict:
@@ -259,12 +277,20 @@ def calculate_sha256(file_id: str, request: Request):
 @app.get("/api/download")
 def download(request: Request, storage: str, path: str):
     check(request, storage, path)
+    entry = adapter(storage).info(path)
+    if not entry["directory"]:
+        with database() as db:
+            metadata.observe(db, entry)
     return adapter(storage).serve(path, inline=False)
 
 
 @app.get("/api/preview")
 def preview(request: Request, storage: str, path: str):
     check(request, storage, path)
+    entry = adapter(storage).info(path)
+    if not entry["directory"]:
+        with database() as db:
+            metadata.observe(db, entry)
     return adapter(storage).serve(path, inline=True)
 
 
@@ -276,6 +302,28 @@ def mkdir(body: PathBody, request: Request):
     return result
 
 
+@app.post("/api/folders/ensure")
+def ensure_folders(body: EnsureFoldersBody, request: Request):
+    if len(body.paths) > 1000:
+        raise HTTPException(400, "Слишком много папок в одной части запроса")
+    selected = adapter(body.storage)
+    created = 0
+    for path in sorted(set(body.paths), key=lambda value: (value.count("/"), value)):
+        if not path:
+            raise HTTPException(400, "Некорректный путь")
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        check(request, body.storage, parent, 2)
+        try:
+            selected.mkdir(path)
+        except HTTPException as error:
+            if error.status_code != 409 or not selected.is_dir(path):
+                raise
+        else:
+            audit(request, "mkdir", body.storage, path)
+            created += 1
+    return {"created": created}
+
+
 @app.post("/api/uploads")
 def start_upload(body: UploadBody, request: Request):
     check(request, body.storage, body.path.rsplit("/", 1)[0] if "/" in body.path else "", 2)
@@ -283,6 +331,8 @@ def start_upload(body: UploadBody, request: Request):
         raise HTTPException(400, "Некорректный размер файла")
     upload_id = uuid.uuid4().hex
     selected = adapter(body.storage)
+    if selected.exists(body.path):
+        raise HTTPException(409, "Такое имя уже существует")
     selected.create_upload(upload_id, body.path)
     with database() as db:
         db.execute("INSERT INTO uploads(id,storage,path,size,created_at,user_id) VALUES(?,?,?,?,?,?)",
@@ -378,8 +428,9 @@ def move(body: MoveBody, request: Request):
 @app.post("/api/favorite")
 def favorite(body: PathBody, request: Request):
     check(request, body.storage, body.path)
-    adapter(body.storage).info(body.path)
+    entry = adapter(body.storage).info(body.path)
     with database() as db:
+        metadata.observe(db, entry)
         exists = db.execute("SELECT 1 FROM user_favorites WHERE user_id=? AND storage=? AND path=?", (actor(request)["id"], body.storage, body.path)).fetchone()
         if exists:
             db.execute("DELETE FROM user_favorites WHERE user_id=? AND storage=? AND path=?", (actor(request)["id"], body.storage, body.path))
@@ -391,15 +442,16 @@ def favorite(body: PathBody, request: Request):
 @app.get("/api/favorites")
 def favorites(request: Request):
     with database() as db:
-        rows = list(db.execute("SELECT storage,path FROM user_favorites WHERE user_id=? ORDER BY path", (actor(request)["id"],)))
+        rows = list(db.execute("""SELECT f.storage,f.path,m.id FROM user_favorites f
+                  LEFT JOIN file_metadata m ON m.storage=f.storage AND m.path=f.path AND m.status='active'
+                  WHERE f.user_id=? ORDER BY f.path""", (actor(request)["id"],)))
     result = []
     for row in rows:
         if not authz.permission(actor(request), row["storage"], row["path"]):
             continue
         try:
             entry = adapter(row["storage"]).info(row["path"])
-            with database() as db:
-                entry["id"] = metadata.observe(db, entry)
+            entry["id"] = row["id"]
             result.append({**entry, "favorite": True})
         except HTTPException:
             pass

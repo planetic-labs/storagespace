@@ -2,6 +2,16 @@ import { createApp } from 'vue'
 import './prototype.css'
 import { openAdmin } from './admin.js'
 
+let installPrompt = null
+window.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault()
+  installPrompt = event
+})
+window.addEventListener('appinstalled', () => {
+  installPrompt = null
+  document.querySelector('#installApp')?.remove()
+})
+
 const $ = selector => document.querySelector(selector)
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[ch])
 const icon = (name, size=20) => `<svg width="${size}" height="${size}" aria-hidden="true"><use href="#i-${name}"/></svg>`
@@ -41,14 +51,30 @@ function init(user) {
   const displayName=user.email.split('@')[0].replace(/[._-]+/g,' ').trim()||user.email
   $('#profileName').textContent=displayName
   $('#profileAvatar').textContent=displayName.split(' ').map(part=>part[0]||'').slice(0,2).join('').toUpperCase()
-  $('#profileMenu').innerHTML=(user.admin?'<button id="openAdministration">Администрирование</button>':'')+'<button id="logout">Выйти</button>'
+  const installed=window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true
+  $('#profileMenu').innerHTML=(user.admin?'<button id="openAdministration">Администрирование</button>':'')+(installed?'':'<button id="installApp">Установить приложение</button>')+'<button id="logout">Выйти</button>'
   $('#profileButton').onclick=()=>{$('#profileMenu').hidden=!$('#profileMenu').hidden}
   $('#profileMenu').onclick=async event=>{
     if(event.target.id==='openAdministration'){$('#profileMenu').hidden=true;await openAdmin()}
+    if(event.target.id==='installApp'){
+      $('#profileMenu').hidden=true
+      if(installPrompt){
+        const prompt=installPrompt
+        installPrompt=null
+        await prompt.prompt()
+      }else{
+        const ios=/iPhone|iPad|iPod/.test(navigator.userAgent)
+        const macSafari=/Macintosh/.test(navigator.userAgent)&&/Safari/.test(navigator.userAgent)&&!/Chrome|CriOS|Chromium|Edg/.test(navigator.userAgent)
+        const instruction=ios?'В Safari нажмите «Поделиться» → «На экран Домой», включите «Открывать как веб-приложение» и нажмите «Добавить».':macSafari?'В Safari откройте меню «Файл» → «Добавить в Dock» или нажмите «Поделиться» → «Добавить в Dock».':'Откройте меню браузера и выберите «Установить приложение» или «Добавить на главный экран». В некоторых браузерах значок установки находится рядом с адресной строкой.'
+        modal('Установить приложение',`<p class="modal-note">${instruction}</p><div class="modal-footer"><button class="primary-button" id="installHelpOk">Понятно</button></div>`,true)
+        $('#installHelpOk').onclick=closeModal
+      }
+    }
     if(event.target.id==='logout'){await fetch('/api/auth/logout',{method:'POST'});location.reload()}
   }
   let storages = [], files = []
   const uploadQueue = []
+  let pendingUploadTasks = [], nextPendingUpload = 0, folderPreparation = null, folderPreparationChain = Promise.resolve(), folderUploadGeneration = 0
   let uploadWorkerRunning = false, uploadPanelCollapsed = false, nextUploadId = 0
   const uploadPanel=document.createElement('aside')
   uploadPanel.id='uploadPanel'
@@ -57,7 +83,7 @@ function init(user) {
   document.body.append(uploadPanel)
   const fileDragHint=document.createElement('div')
   fileDragHint.className='file-drag-hint'
-  fileDragHint.innerHTML=`${icon('upload',36)}<strong>Отпустите файлы для загрузки</strong><span>В текущее хранилище или в папку под курсором</span>`
+  fileDragHint.innerHTML=`${icon('upload',36)}<strong>Отпустите файлы или папку для загрузки</strong><span>В текущее хранилище или в папку под курсором</span>`
   document.body.append(fileDragHint)
   let fileDragTimer
   const externalFiles=e=>Array.from(e.dataTransfer?.types||[]).includes('Files')
@@ -67,25 +93,34 @@ function init(user) {
   const fileById = id => files.find(f => f.id === id)
   const fileUrl = (f, kind='preview') => f.fileId ? '/api/files/'+encodeURIComponent(f.fileId)+'/content?download='+(kind==='download'?'true':'false') : '/api/' + kind + '?' + params({storage:f.storage,path:f.path})
   const asFile = (entry, index) => ({ ...entry, fileId:entry.id||null, id:String(index), type:typeOf(entry), date:date(entry.modified), displaySize:entry.directory?'—':size(entry.size) })
+  const ensureFileId = async f => {
+    if(f.fileId)return f.fileId
+    const record=await api('/files/resolve',jsonBody({storage:f.storage,path:f.path}))
+    f.fileId=record.id
+    return record.id
+  }
   function showToast(message) { const target=$('#toast'); target.textContent=message; target.classList.add('open'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>target.classList.remove('open'),3500) }
   const uploadKey = task => 'storagespace-upload:'+task.storage+':'+task.path+':'+task.file.size+':'+task.file.lastModified
   function renderUploadPanel() {
-    if(!uploadQueue.length){uploadPanel.className='upload-panel';uploadPanel.innerHTML='';return}
+    if(!uploadQueue.length&&!folderPreparation){uploadPanel.className='upload-panel';uploadPanel.innerHTML='';return}
     const pending=uploadQueue.filter(task=>task.status==='queued'||task.status==='uploading').length
     const errors=uploadQueue.filter(task=>task.status==='error').length
-    const count=pending||errors||uploadQueue.length
-    const title=pending?`Загружается ${count} ${count===1?'файл':count<5?'файла':'файлов'}`:errors?`Ошибки загрузки · ${errors}`:'Загрузка завершена'
+    const done=uploadQueue.filter(task=>task.status==='done').length
+    const skipped=uploadQueue.filter(task=>task.status==='skipped').length
+    const title=folderPreparation?.cancelRequested?'Отмена загрузки папок':folderPreparation?`Подготовка папок · ${folderPreparation.done}/${folderPreparation.total}`:pending?`Загружается ${pending} ${pending===1?'файл':pending<5?'файла':'файлов'}`:errors?`Ошибки загрузки · ${errors}`:'Загрузка завершена'
+    const active=uploadQueue.find(task=>task.status==='uploading')
+    const visible=uploadQueue.length<=12?uploadQueue:[active,...uploadQueue.filter(task=>task.status==='queued').slice(0,3),...uploadQueue.filter(task=>task.status==='error').slice(0,3),...uploadQueue.filter(task=>task.status==='skipped').slice(-2),...uploadQueue.filter(task=>task.status==='done').slice(-2)].filter((task,index,array)=>task&&array.indexOf(task)===index)
     uploadPanel.className='upload-panel open'+(uploadPanelCollapsed?' collapsed':'')
-    uploadPanel.innerHTML=`<div class="upload-panel-head"><strong>${title}</strong><div class="upload-panel-controls"><button data-upload-toggle aria-label="${uploadPanelCollapsed?'Развернуть загрузки':'Свернуть загрузки'}">${uploadPanelCollapsed?'⌃':'⌄'}</button><button data-upload-dismiss aria-label="Скрыть панель загрузок">×</button></div></div><div class="upload-panel-body">${uploadQueue.map(task=>{
+    uploadPanel.innerHTML=`<div class="upload-panel-head"><strong>${title}</strong><div class="upload-panel-controls"><button data-upload-toggle aria-label="${uploadPanelCollapsed?'Развернуть загрузки':'Свернуть загрузки'}">${uploadPanelCollapsed?'⌃':'⌄'}</button><button data-upload-dismiss aria-label="${pending||errors||folderPreparation?'Отменить все загрузки':'Закрыть панель загрузок'}">×</button></div></div><div class="upload-panel-body">${uploadQueue.length?`<div class="upload-summary">Загружено ${done} из ${uploadQueue.length} · Пропущено ${skipped}${errors?' · Ошибок '+errors:''}</div>`:''}${visible.map(task=>{
       const percent=task.file.size?Math.min(100,Math.round(task.offset/task.file.size*100)):task.status==='done'?100:0
       const circumference=62.83
       const ring=`<svg class="upload-ring" width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle class="upload-ring-track" cx="13" cy="13" r="10"/><circle class="upload-ring-value" cx="13" cy="13" r="10" stroke-dasharray="${circumference}" stroke-dashoffset="${(circumference*(1-percent/100)).toFixed(2)}"/></svg>`
-      const status=task.status==='done'?'<span class="upload-done" role="img" aria-label="Загружено">✓</span>':task.status==='error'?`<button class="upload-retry" data-upload-retry="${task.id}" aria-label="Повторить загрузку ${esc(task.file.name)}" title="${esc(task.error||'Ошибка загрузки')}">↻</button>`:task.cancelRequested?'<span class="upload-cancelling" aria-label="Отменяется">×</span>':task.phase==='finishing'?ring:`<button class="upload-progress" data-upload-cancel="${task.id}" aria-label="Отменить загрузку ${esc(task.file.name)}, ${percent}%" title="Отменить загрузку">${ring}<span class="upload-progress-cross">×</span></button>`
-      return `<div class="upload-item ${task.status}"><span class="upload-file-icon" aria-hidden="true">${icon('file',17)}</span><span class="upload-item-name" title="${esc(task.file.name)}">${esc(task.file.name)}</span>${status}</div>`
-    }).join('')}</div>`
+      const status=task.status==='done'?'<span class="upload-done" role="img" aria-label="Загружено">✓</span>':task.status==='skipped'?'<span class="upload-skipped" role="img" aria-label="Пропущено: файл уже существует">—</span>':task.status==='error'?`<button class="upload-retry" data-upload-retry="${task.id}" aria-label="Повторить загрузку ${esc(task.file.name)}" title="${esc(task.error||'Ошибка загрузки')}">↻</button>`:task.cancelRequested?'<span class="upload-cancelling" aria-label="Отменяется">×</span>':task.phase==='finishing'?ring:`<button class="upload-progress" data-upload-cancel="${task.id}" aria-label="Отменить загрузку ${esc(task.file.name)}, ${percent}%" title="Отменить загрузку">${ring}<span class="upload-progress-cross">×</span></button>`
+      return `<div class="upload-item ${task.status}"><span class="upload-file-icon" aria-hidden="true">${icon('file',17)}</span><span class="upload-item-name" title="${esc(task.path)}">${esc(task.folderBatch?task.relativePath:task.file.name)}</span>${status}</div>`
+    }).join('')}${uploadQueue.length>visible.length?`<div class="upload-summary">И ещё ${uploadQueue.length-visible.length} файлов в очереди и истории</div>`:''}</div>`
   }
-  function closeModal() { $('#overlay').classList.remove('open');delete $('#modal').dataset.fileId;$('#modal').innerHTML='' }
-  function modal(title, content, compact=false) { delete $('#modal').dataset.fileId;$('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
+  function closeModal() { $('#overlay').classList.remove('open');delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').innerHTML='' }
+  function modal(title, content, compact=false) { delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
   function closeMenu() { $('#context').classList.remove('open') }
   function showContextMenu(f,x,y) {
     if (!f||f.trashChild) return
@@ -145,7 +180,7 @@ function init(user) {
   }
   async function selectStorage(id) { state.storage=id;state.folder='';state.view='all';state.trashBrowse=null;state.selected=null;state.search='';$('#search').value='';$('#sidebar').classList.remove('open');await load() }
   async function selectView(view) { state.view=view;state.folder='';state.trashBrowse=null;state.selected=null;state.search='';$('#search').value='';$('#sidebar').classList.remove('open');await load() }
-  function openFile(f) {
+  async function openFile(f) {
     if(!f)return
     if(f.trashed){
       if(f.directory){
@@ -156,18 +191,26 @@ function init(user) {
       return
     }
     if(f.directory){state.storage=f.storage;state.folder=f.path;state.view='all';state.search='';$('#search').value='';void load()}
-    else if(['video','audio','image','pdf'].includes(f.type))preview(f)
-    else window.open(fileUrl(f,'download'),'_blank')
+    else if(['video','audio','image','pdf'].includes(f.type))await preview(f)
+    else await download(f)
   }
-  function preview(f) {
+  async function preview(f) {
+    try{await ensureFileId(f)}catch(error){showToast(error.message);return}
     const url=fileUrl(f)
     const content=f.type==='video'?`<video controls autoplay src="${url}"></video>`:f.type==='audio'?`<audio controls autoplay src="${url}"></audio>`:f.type==='image'?`<img src="${url}" alt="${esc(f.name)}">`:`<iframe src="${url}" title="${esc(f.name)}"></iframe>`
     modal(f.name,`<div class="real-preview">${content}</div><div class="modal-footer"><a class="primary-button" href="${fileUrl(f,'download')}">Скачать</a></div>`)
   }
-  function download(f) { window.open(fileUrl(f,'download'),'_blank') }
+  async function download(f) {
+    try{await ensureFileId(f)}catch(error){showToast(error.message);return}
+    const link=document.createElement('a');link.href=fileUrl(f,'download');link.hidden=true;document.body.append(link);link.click();link.remove()
+  }
   async function details(f) {
-    if(!f.fileId)return showToast('Обновите папку и попробуйте снова')
     modal('Сведения о файле','<p class="modal-note">Загрузка сведений…</p>',true)
+    const resolveToken=Math.random().toString(36).slice(2)
+    $('#modal').dataset.resolveToken=resolveToken
+    try{await ensureFileId(f)}catch(error){if($('#modal').dataset.resolveToken===resolveToken){closeModal();showToast(error.message)}return}
+    if(!$('#overlay').classList.contains('open')||$('#modal').dataset.resolveToken!==resolveToken)return
+    delete $('#modal').dataset.resolveToken
     $('#modal').dataset.fileId=f.fileId
     const refresh=async()=>{
       try {
@@ -242,18 +285,101 @@ function init(user) {
     modal('Новая папка','<label class="field" for="folderName">Название папки</label><input class="text-field" id="folderName" placeholder="Например, Материалы"><div class="modal-footer"><button class="soft-button" id="cancelFolder">Отмена</button><button class="primary-button" id="confirmFolder">Создать</button></div>',true)
     $('#folderName').focus();$('#cancelFolder').onclick=closeModal;$('#confirmFolder').onclick=()=>{const name=$('#folderName').value.trim();if(name)mutate(()=>api('/folders',jsonBody({storage:state.storage,path:[state.folder,name].filter(Boolean).join('/')})),'Папка создана')};$('#folderName').onkeydown=e=>{if(e.key==='Enter')$('#confirmFolder').click()}
   }
+  const validRelativePath=path=>{
+    const parts=path.split('/')
+    return parts.every(part=>part&&part!=='.'&&part!=='..'&&!part.startsWith('.')&&!part.includes('\\')&&!part.includes('\0')&&filenameBytes(part)<=255)&&filenameBytes(path)<=4095
+  }
+  async function readDroppedEntry(entry,prefix,manifest){
+    if(entry.name.startsWith('.')){manifest.ignored++;return}
+    const relativePath=prefix+entry.name
+    if(entry.isDirectory){
+      manifest.dirs.add(relativePath)
+      const reader=entry.createReader()
+      while(true){
+        const children=await new Promise((resolve,reject)=>reader.readEntries(resolve,reject))
+        if(!children.length)break
+        await Promise.all(children.map(child=>readDroppedEntry(child,relativePath+'/',manifest)))
+      }
+    }else if(entry.isFile){
+      const file=await new Promise((resolve,reject)=>entry.file(resolve,reject))
+      manifest.files.push({file,relativePath})
+    }
+  }
+  function prepareFolderManifest(manifest,destination,storage){
+    const validDirs=new Set([...manifest.dirs].filter(path=>{if(validRelativePath(path))return true;manifest.ignored++;return false}))
+    const validFiles=manifest.files.filter(item=>{
+      if(validRelativePath(item.relativePath))return true
+      manifest.ignored++;return false
+    })
+    for(const item of validFiles){
+      const parts=item.relativePath.split('/')
+      for(let i=1;i<parts.length;i++)validDirs.add(parts.slice(0,i).join('/'))
+    }
+    const dirs=[...validDirs].filter(path=>validRelativePath(path)).sort((a,b)=>a.split('/').length-b.split('/').length||a.localeCompare(b))
+    const files=validFiles.filter(item=>item.relativePath.split('/').slice(0,-1).every((_,i,parts)=>validDirs.has(parts.slice(0,i+1).join('/'))))
+    const bytes=files.reduce((total,item)=>total+item.file.size,0)
+    if(!files.length&&!dirs.length){showToast('В папке нет файлов и папок, которые можно загрузить');return}
+    modal('Загрузить папку',`<div class="folder-upload-summary"><strong>${files.length} файлов · ${size(bytes)}</strong><span>${dirs.length} папок${manifest.ignored?' · пропущено скрытых или некорректных элементов: '+manifest.ignored:''}</span><span>Место: ${esc(storages.find(item=>item.id===storage)?.name||storage)}${destination?' / '+esc(destination):''}</span></div><p class="modal-note">Структура папок сохранится. Существующие файлы не будут перезаписаны.</p><div class="modal-footer"><button class="soft-button" id="cancelFolderUpload">Отмена</button><button class="primary-button" id="startFolderUpload">Начать загрузку</button></div>`,true)
+    $('#cancelFolderUpload').onclick=closeModal
+    $('#startFolderUpload').onclick=()=>{
+      closeModal()
+      if(folderPreparation)showToast('Папка добавлена в очередь подготовки')
+      const generation=folderUploadGeneration
+      folderPreparationChain=folderPreparationChain.then(()=>startFolderUpload({files,dirs},destination,storage,generation))
+    }
+  }
+  async function startFolderUpload(manifest,destination,storage,generation){
+    if(generation!==folderUploadGeneration)return
+    folderPreparation={done:0,total:manifest.dirs.length}
+    uploadPanelCollapsed=false;renderUploadPanel()
+    try {
+      for(let index=0;index<manifest.dirs.length;index+=250){
+        const paths=manifest.dirs.slice(index,index+250).map(path=>[destination,path].filter(Boolean).join('/'))
+        await api('/folders/ensure',jsonBody({storage,paths}))
+        if(generation!==folderUploadGeneration){folderPreparation=null;renderUploadPanel();return}
+        folderPreparation.done+=paths.length;renderUploadPanel()
+      }
+      folderPreparation=null
+      let added=0
+      const activePaths=new Set(uploadQueue.filter(task=>task.storage===storage&&['queued','uploading'].includes(task.status)).map(task=>task.path))
+      for(const {file,relativePath} of manifest.files){
+        const path=[destination,relativePath].filter(Boolean).join('/')
+        if(activePaths.has(path))continue
+        const task={id:++nextUploadId,file,storage,folder:path.split('/').slice(0,-1).join('/'),path,relativePath,folderBatch:true,status:'queued',offset:0,error:''}
+        uploadQueue.push(task);pendingUploadTasks.push(task);activePaths.add(path);added++
+      }
+      renderUploadPanel()
+      if(state.view==='all'&&state.storage===storage&&state.folder===destination)void load()
+      if(added){showToast(`Добавлено файлов в очередь: ${added}`);void drainUploadQueue()}
+      else showToast(manifest.files.length?'Эти файлы уже находятся в очереди':'Папки созданы')
+    } catch(error){
+      folderPreparation=null;renderUploadPanel()
+      if(generation!==folderUploadGeneration)return
+      modal('Не удалось подготовить папку',`<p class="modal-note">${esc(error.message)}. Уже созданные папки сохраняются; можно повторить загрузку.</p><div class="modal-footer"><button class="primary-button" id="folderUploadErrorOk">Понятно</button></div>`,true)
+      $('#folderUploadErrorOk').onclick=closeModal
+    }
+  }
+  async function handleExternalDrop(roots,fallbackFiles,destination,storage){
+    if(state.view!=='all'||!storage){showToast('Сначала откройте хранилище');return}
+    if(!roots.length){if(fallbackFiles.length)addFiles(fallbackFiles,destination);else showToast('Браузер не передал содержимое папки. Используйте «Выбрать папку».');return}
+    const manifest={files:[],dirs:new Set(),ignored:0}
+    try {await Promise.all(roots.map(entry=>readDroppedEntry(entry,'',manifest)))}
+    catch(error){showToast('Не удалось прочитать папку: '+error.message);return}
+    if(!manifest.dirs.size){addFiles(manifest.files.map(item=>item.file),destination);return}
+    prepareFolderManifest(manifest,destination,storage)
+  }
   function uploadModal() {
     if(state.view!=='all')return showToast('Сначала откройте хранилище')
-    modal('Загрузить файлы',`<div class="dropzone" id="dropzone">${icon('upload',32)}<strong>Перетащите файлы сюда</strong><p>или выберите их на устройстве</p><button class="soft-button" id="chooseFiles">Выбрать файлы</button></div><p class="modal-note">После выбора загрузка продолжится в фоне. Новые файлы добавятся в очередь.</p>`,true)
-    $('#chooseFiles').onclick=()=>$('#fileInput').click();const zone=$('#dropzone');zone.ondragover=e=>{e.preventDefault();zone.classList.add('drag-over')};zone.ondragleave=()=>zone.classList.remove('drag-over');zone.ondrop=e=>{e.preventDefault();addFiles(e.dataTransfer.files)}
+    modal('Загрузить',`<div class="dropzone" id="dropzone">${icon('upload',32)}<strong>Перетащите файлы или папку сюда</strong><p>или выберите на устройстве</p><div class="upload-choices"><button class="soft-button" id="chooseFiles">Выбрать файлы</button><button class="soft-button" id="chooseFolder">Выбрать папку</button></div></div><p class="modal-note">После выбора загрузка продолжится в фоне. Новые файлы добавятся в очередь.</p>`,true)
+    $('#chooseFiles').onclick=()=>$('#fileInput').click();$('#chooseFolder').onclick=()=>$('#folderInput').click();const zone=$('#dropzone');zone.ondragover=e=>{e.preventDefault();zone.classList.add('drag-over')};zone.ondragleave=()=>zone.classList.remove('drag-over')
   }
-  async function discardUpload(task) {
+  async function discardUpload(task, updatePanel=true) {
     const key=uploadKey(task), sessionId=task.sessionId||localStorage.getItem(key)
     if(sessionId){try{await api('/uploads/'+sessionId,{method:'DELETE'})}catch(error){if(error.status!==404)throw error}}
     localStorage.removeItem(key)
     const index=uploadQueue.indexOf(task)
     if(index>=0)uploadQueue.splice(index,1)
-    renderUploadPanel()
+    if(updatePanel)renderUploadPanel()
   }
   function confirmCancelUpload(task) {
     if(!task||task.status==='done'||task.phase==='finishing'||task.cancelRequested)return
@@ -274,6 +400,35 @@ function init(user) {
     if(task.status!=='uploading'){
       try{await discardUpload(task)}catch(error){task.status='error';task.error=error.message;task.cancelRequested=false;renderUploadPanel()}
     }
+  }
+  function dismissFinishedUploads(){
+    for(let i=uploadQueue.length-1;i>=0;i--)if(['done','skipped'].includes(uploadQueue[i].status))uploadQueue.splice(i,1)
+    renderUploadPanel()
+  }
+  function confirmCancelAllUploads(){
+    const unfinished=uploadQueue.filter(task=>['queued','uploading','error'].includes(task.status))
+    if(!unfinished.length&&!folderPreparation){dismissFinishedUploads();return}
+    const count=unfinished.length
+    modal('Прервать все загрузки?',`<p class="modal-note">${count?`Незавершённых загрузок: ${count}. `:''}Недокачанные части будут удалены с сервера. Уже загруженные файлы останутся на месте.${folderPreparation?' Создание новых папок остановится после текущего запроса; уже созданные папки сохранятся.':''}</p><div class="modal-footer"><button class="soft-button" id="keepAllUploads">Продолжить загрузку</button><button class="primary-button" id="confirmCancelAllUploads">Прервать все</button></div>`,true)
+    $('#keepAllUploads').onclick=closeModal
+    $('#confirmCancelAllUploads').onclick=()=>{closeModal();void cancelAllUploads()}
+    $('#keepAllUploads').focus()
+  }
+  async function cancelAllUploads(){
+    folderUploadGeneration++
+    if(folderPreparation)folderPreparation.cancelRequested=true
+    uploadPanelCollapsed=false
+    const unfinished=uploadQueue.filter(task=>['queued','uploading','error'].includes(task.status))
+    for(const task of unfinished){task.cancelRequested=true;task.controller?.abort()}
+    dismissFinishedUploads()
+    const inactive=unfinished.filter(task=>task.status!=='uploading')
+    const results=await Promise.allSettled(inactive.map(task=>discardUpload(task,false)))
+    for(let i=0;i<results.length;i++)if(results[i].status==='rejected'){
+      inactive[i].status='error';inactive[i].error=results[i].reason?.message||'Не удалось удалить недокачанный файл';inactive[i].cancelRequested=false
+    }
+    renderUploadPanel()
+    if(results.some(result=>result.status==='rejected'))showToast('Не все недокачанные файлы удалось удалить. Проверьте ошибки в панели.')
+    else showToast('Загрузки отменены')
   }
   async function uploadOne(task) {
     const {file,storage,path}=task, key=uploadKey(task)
@@ -302,9 +457,9 @@ function init(user) {
     if(uploadWorkerRunning)return
     uploadWorkerRunning=true
     try {
-      while(true){
-        const task=uploadQueue.find(item=>item.status==='queued'&&!item.cancelRequested)
-        if(!task)break
+      while(nextPendingUpload<pendingUploadTasks.length){
+        const task=pendingUploadTasks[nextPendingUpload++]
+        if(task.status!=='queued'||task.cancelRequested)continue
         task.status='uploading';renderUploadPanel()
         try {
           await uploadOne(task)
@@ -313,10 +468,17 @@ function init(user) {
           void refreshStorages().catch(()=>{})
         } catch(error) {
           if(task.cancelRequested){try{await discardUpload(task)}catch(cleanupError){task.status='error';task.error=cleanupError.message;task.cancelRequested=false;renderUploadPanel()}}
+          else if(task.folderBatch&&error.status===409&&error.message==='Такое имя уже существует'){
+            try {
+              if(task.sessionId)await api('/uploads/'+task.sessionId,{method:'DELETE'})
+              localStorage.removeItem(uploadKey(task))
+              task.status='skipped';task.error='Файл уже существует';renderUploadPanel()
+            } catch(cleanupError){task.status='error';task.error=cleanupError.message;renderUploadPanel()}
+          }
           else{task.status='error';task.error=error.message;renderUploadPanel()}
         }
       }
-    } finally {uploadWorkerRunning=false;renderUploadPanel()}
+    } finally {pendingUploadTasks=[];nextPendingUpload=0;uploadWorkerRunning=false;renderUploadPanel()}
   }
   function addFiles(list, destination=state.folder) {
     const selected=[...list]
@@ -333,10 +495,12 @@ function init(user) {
       return
     }
     let added=0
+    const activePaths=new Set(uploadQueue.filter(task=>task.storage===storage&&['queued','uploading'].includes(task.status)).map(task=>task.path))
     for(const file of selected){
       const path=[destination,file.name].filter(Boolean).join('/')
-      if(uploadQueue.some(task=>task.storage===storage&&task.path===path&&['queued','uploading'].includes(task.status)))continue
-      uploadQueue.push({id:++nextUploadId,file,storage,folder:destination,path,status:'queued',offset:0,error:''})
+      if(activePaths.has(path))continue
+      const task={id:++nextUploadId,file,storage,folder:destination,path,status:'queued',offset:0,error:''}
+      uploadQueue.push(task);pendingUploadTasks.push(task);activePaths.add(path)
       added++
     }
     if($('#dropzone'))closeModal()
@@ -349,11 +513,11 @@ function init(user) {
     if(e.target.closest('#retryStorage')){void refreshStorages(true).then(()=>load()).catch(error=>showToast(error.message));return}
     if(!e.target.closest('#profileButton,#profileMenu'))$('#profileMenu').hidden=true
     if(e.target.closest('[data-upload-toggle]')){uploadPanelCollapsed=!uploadPanelCollapsed;renderUploadPanel();return}
-    if(e.target.closest('[data-upload-dismiss]')){for(let i=uploadQueue.length-1;i>=0;i--)if(uploadQueue[i].status==='done')uploadQueue.splice(i,1);uploadPanelCollapsed=true;renderUploadPanel();return}
+    if(e.target.closest('[data-upload-dismiss]')){confirmCancelAllUploads();return}
     const cancel=e.target.closest('[data-upload-cancel]')
     if(cancel){confirmCancelUpload(uploadQueue.find(item=>item.id===Number(cancel.dataset.uploadCancel)));return}
     const retry=e.target.closest('[data-upload-retry]')
-    if(retry){const task=uploadQueue.find(item=>item.id===Number(retry.dataset.uploadRetry));if(task?.status==='error'){task.status='queued';task.error='';task.cancelRequested=false;task.phase='';renderUploadPanel();void drainUploadQueue()}return}
+    if(retry){const task=uploadQueue.find(item=>item.id===Number(retry.dataset.uploadRetry));if(task?.status==='error'){task.status='queued';task.error='';task.cancelRequested=false;task.phase='';pendingUploadTasks.push(task);renderUploadPanel();void drainUploadQueue()}return}
     const storage=e.target.closest('[data-storage]');if(storage)return selectStorage(storage.dataset.storage)
     const nav=e.target.closest('[data-nav]');if(nav)return selectView(nav.dataset.nav)
     if(e.target.closest('[data-trash-root]')){state.trashBrowse=null;state.selected=null;return load()}
@@ -398,6 +562,18 @@ function init(user) {
   $('#search').oninput=e=>{state.search=e.target.value;render()}
   $('#newFolderHeading').onclick=createFolder;$('#uploadTop').onclick=uploadModal
   $('#fileInput').onchange=e=>{addFiles(e.target.files);e.target.value=''}
+  $('#folderInput').onchange=e=>{
+    const manifest={files:[],dirs:new Set(),ignored:0}
+    for(const file of e.target.files){
+      const relativePath=file.webkitRelativePath||file.name
+      manifest.files.push({file,relativePath})
+      const parts=relativePath.split('/')
+      for(let i=1;i<parts.length;i++)manifest.dirs.add(parts.slice(0,i).join('/'))
+    }
+    e.target.value=''
+    if(!manifest.files.length)return showToast('В выбранной папке нет файлов. Пустую папку можно создать кнопкой «Новая папка».')
+    prepareFolderManifest(manifest,state.folder,state.storage)
+  }
   $('#menuToggle').onclick=()=>$('#sidebar').classList.toggle('open')
   $('#overlay').onclick=e=>{if(e.target===$('#overlay'))closeModal()}
   document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();closeMenu();$('#sidebar').classList.remove('open')}})
@@ -416,7 +592,11 @@ function init(user) {
     e.stopPropagation()
     hideFileDrag()
     const row=e.target.closest('#rows .row'),target=row&&fileById(row.dataset.id)
-    addFiles(e.dataTransfer.files,target?.directory?target.path:state.folder)
+    const destination=target?.directory?target.path:state.folder
+    const storage=state.storage
+    const roots=[...(e.dataTransfer?.items||[])].map(item=>item.webkitGetAsEntry?.()||item.getAsEntry?.()).filter(Boolean)
+    const fallbackFiles=[...(e.dataTransfer?.files||[])]
+    void handleExternalDrop(roots,fallbackFiles,destination,storage)
   },true)
   refreshStorages().then(load).catch(e=>showToast(e.message))
   window.setInterval(()=>{void refreshStorages().catch(()=>{})},30000)
@@ -452,3 +632,8 @@ async function start() {
   } catch { showLogin() }
 }
 start()
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js', {updateViaCache:'none'}).catch(() => {})
+  })
+}
