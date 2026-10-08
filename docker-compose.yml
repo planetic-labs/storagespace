@@ -1,7 +1,12 @@
 name: storagespace-dev
 services:
   backend:
-    build: ./backend
+    platform: linux/amd64
+    build:
+      context: ./backend
+      platforms: [linux/amd64]
+      provenance: false
+      sbom: false
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -29,7 +34,12 @@ services:
         max-size: 10m
         max-file: "3"
   frontend:
-    build: ./frontend
+    platform: linux/amd64
+    build:
+      context: ./frontend
+      platforms: [linux/amd64]
+      provenance: false
+      sbom: false
     restart: unless-stopped
     init: true
     stop_grace_period: 15s

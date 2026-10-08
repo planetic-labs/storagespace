@@ -41,8 +41,8 @@ jobs:
           file: ./${{ matrix.component }}/Dockerfile
           push: true
           platforms: linux/amd64
-          provenance: true
-          sbom: true
+          provenance: false
+          sbom: false
           tags: ghcr.io/planetic-labs/storagespace-${{ matrix.component }}:${{ github.event.release.tag_name }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
