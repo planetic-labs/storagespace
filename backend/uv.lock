@@ -401,7 +401,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9,<3" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0,<1" },
 ]
 
 [[package]]
