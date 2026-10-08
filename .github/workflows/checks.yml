@@ -9,6 +9,17 @@ permissions:
   contents: read
 
 jobs:
+  release-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate release script and production Compose
+        run: |
+          bash -n scripts/release.sh
+          ./scripts/release.sh --dry-run
+          cp .env.auth.example .env.auth
+          docker compose --env-file .env.prod.example -f docker-compose.prod.yml config --quiet
+
   build:
     runs-on: ubuntu-latest
     strategy:

@@ -1,6 +1,7 @@
 storage/
 .env
 .env.auth
+.env.prod
 frontend/node_modules/
 frontend/dist/
 backend/.venv/
