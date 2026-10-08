@@ -40,7 +40,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "127.0.0.1:${APP_PORT:-50007}:80"
+      - "127.0.0.1:${APP_PORT:-50006}:80"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
       interval: 30s
