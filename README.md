@@ -74,6 +74,36 @@ docker compose up -d --build
 `APP_PORT` в `.env`. Страница открывается через Caddy по адресу
 `https://storagespace.example` (замените адресом своего домена).
 
+## Релизы и запуск готовых образов
+
+Релиз создаётся из чистой, актуальной ветки `main` командой:
+
+```sh
+./scripts/release.sh
+```
+
+Скрипт создаёт GitHub Release с UTC-датой в теге (`vYYYY.MM.DD`, при повторном
+релизе в тот же день — `-patchN`) и ждёт завершения публикации двух образов:
+`ghcr.io/planetic-labs/storagespace-backend:<тег>` и
+`ghcr.io/planetic-labs/storagespace-frontend:<тег>`. Проверить следующий тег без
+создания релиза можно командой `./scripts/release.sh --dry-run`.
+
+Для запуска готовых образов скопируйте `.env.prod.example` в `.env.prod` и
+укажите опубликованный `IMAGE_TAG`, путь SSHFS-монтирования и конфигурацию
+хранилищ. Значения `id` и `path` в `STORAGES_JSON` должны соответствовать путям
+в контейнере; при переходе с существующей установки сохраняйте прежние `id`,
+чтобы записи в SQLite продолжили ссылаться на те же хранилища. Файл `.env.auth`
+с действующими параметрами авторизации также должен находиться рядом с Compose.
+
+```sh
+docker compose --env-file .env.prod -f docker-compose.prod.yml pull
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+```
+
+Образы собираются для `linux/amd64` и привязаны к тегу релиза. Для скачивания
+из GHCR может потребоваться авторизация Docker, если пакеты организации не
+сделаны публичными.
+
 ## Пользователи и права
 
 Вход через Ark Messenger: email и одноразовый код. В токене Ark должны быть

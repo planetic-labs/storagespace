@@ -1,0 +1,53 @@
+name: storagespace
+
+services:
+  backend:
+    image: ghcr.io/planetic-labs/storagespace-backend:${IMAGE_TAG:?Set IMAGE_TAG to a published release tag}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
+    env_file:
+      - .env.auth
+    environment:
+      APP_DATA: /data
+      STORAGES_JSON: ${STORAGES_JSON:?Set STORAGES_JSON in .env.prod}
+    volumes:
+      - app_data:/data
+      - ./storage:${LOCAL_CONTAINER_PATH:?Set LOCAL_CONTAINER_PATH in .env.prod}:rw
+      - ${SSHFS_HOST_PATH:?Set SSHFS_HOST_PATH in .env.prod}:${REMOTE_CONTAINER_PATH:?Set REMOTE_CONTAINER_PATH in .env.prod}:rw
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  frontend:
+    image: ghcr.io/planetic-labs/storagespace-frontend:${IMAGE_TAG:?Set IMAGE_TAG to a published release tag}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:${APP_PORT:-50007}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+
+volumes:
+  app_data:
