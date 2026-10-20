@@ -38,7 +38,7 @@ const date = value => {
   if (day.toDateString() === yesterday.toDateString()) return 'Вчера'
   return day.toLocaleDateString('ru-RU',{day:'numeric',month:'short'})
 }
-const typeOf = entry => entry.directory ? 'folder' : /\.(mp4|webm|mov)$/i.test(entry.name) ? 'video' : /\.(mp3|wav|ogg)$/i.test(entry.name) ? 'audio' : /\.(png|jpe?g|gif|webp)$/i.test(entry.name) ? 'image' : /\.pdf$/i.test(entry.name) ? 'pdf' : /\.zip$/i.test(entry.name) ? 'zip' : 'doc'
+const typeOf = entry => entry.directory ? 'folder' : /\.(mp4|webm|mov)$/i.test(entry.name) ? 'video' : /\.(mp3|wav|ogg)$/i.test(entry.name) ? 'audio' : /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico)$/i.test(entry.name) ? 'image' : /\.(txt|md|markdown|csv|tsv|log|json|jsonl|xml|yaml|yml|toml|ini|cfg|conf|html?|css|js|mjs|ts|tsx|jsx|py|sh|sql)$/i.test(entry.name) ? 'text' : /\.pdf$/i.test(entry.name) ? 'pdf' : /\.zip$/i.test(entry.name) ? 'zip' : 'doc'
 const filenameBytes = name => new TextEncoder().encode(name).length
 const suggestedFilename = name => {
   const dot=name.lastIndexOf('.'),suffix=dot>0?name.slice(dot):''
@@ -120,13 +120,14 @@ function init(user) {
       return `<div class="upload-item ${task.status}"><span class="upload-file-icon" aria-hidden="true">${icon('file',17)}</span><span class="upload-item-name" title="${esc(task.path)}">${esc(task.folderBatch?task.relativePath:task.file.name)}</span>${status}</div>`
     }).join('')}${uploadQueue.length>visible.length?`<div class="upload-summary">И ещё ${uploadQueue.length-visible.length} файлов в очереди и истории</div>`:''}</div>`
   }
-  function closeModal() { $('#overlay').classList.remove('open');delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').innerHTML='' }
-  function modal(title, content, compact=false) { delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
+  let previewController = null
+  function closeModal() { previewController?.abort();previewController=null; $('#overlay').classList.remove('open');delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').innerHTML='' }
+  function modal(title, content, compact=false) { previewController?.abort();previewController=null; delete $('#modal').dataset.fileId;delete $('#modal').dataset.resolveToken;$('#modal').className='modal'+(compact?' compact':''); $('#modal').innerHTML=`<div class="modal-header"><h2>${esc(title)}</h2><button class="close" id="closeModal" aria-label="Закрыть">×</button></div>${content}`; $('#overlay').classList.add('open'); $('#closeModal').onclick=closeModal }
   function closeMenu() { $('#context').classList.remove('open') }
   function showContextMenu(f,x,y) {
     if (!f||f.trashChild) return
     const c=$('#context')
-    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button><button data-menu="details">Сведения</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button data-menu="copy">Копировать</button><button class="danger" data-menu="trash">В корзину</button>`
+    c.innerHTML=f.trashed?'<button data-menu="restore">Восстановить</button><button class="danger" data-menu="permanent">Удалить навсегда</button>':`${['video','audio','image','pdf','text'].includes(f.type)?'<button data-menu="preview">Открыть просмотр</button>':''}<button data-menu="favorite">${f.favorite?'Убрать из избранного':'Добавить в избранное'}</button>${f.type!=='folder'?'<button data-menu="download">Скачать</button><button data-menu="details">Сведения</button>':''}<button data-menu="rename">Переименовать</button><button data-menu="move">Переместить</button><button data-menu="copy">Копировать</button><button class="danger" data-menu="trash">В корзину</button>`
     c.dataset.id=f.id; c.classList.add('open'); c.style.left=Math.max(8,Math.min(x,innerWidth-c.offsetWidth-8))+'px'; c.style.top=Math.max(8,Math.min(y,innerHeight-c.offsetHeight-8))+'px'
   }
   function render() {
@@ -150,7 +151,7 @@ function init(user) {
       $('#breadcrumbs').innerHTML=crumbs.map((crumb,i)=>`${i?'<span>›</span>':''}<button class="crumb" data-crumb="${esc(crumb.path)}" title="Открыть папку или перетащить сюда файл">${esc(crumb.name)}</button>`).join('')
     }
     const visible=files.filter(f=>(f.displayName||f.name||'').toLocaleLowerCase('ru').includes(state.search.toLocaleLowerCase('ru')))
-    $('#rows').innerHTML=offline?`<div class="empty storage-offline">${icon('drive',42)}<h3>Хранилище недоступно</h3><p>Проверяем подключение автоматически. После восстановления монтирования файлы появятся здесь.</p><button class="soft-button" id="retryStorage">Проверить сейчас</button></div>`:visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(f.type==='folder'?'folder':'file',21)}</span><span title="${esc(f.displayName||f.name)}">${esc(f.displayName||f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.displayName||f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.displayName||f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
+    $('#rows').innerHTML=offline?`<div class="empty storage-offline">${icon('drive',42)}<h3>Хранилище недоступно</h3><p>Проверяем подключение автоматически. После восстановления монтирования файлы появятся здесь.</p><button class="soft-button" id="retryStorage">Проверить сейчас</button></div>`:visible.length?visible.map(f=>`<div class="row ${state.selected===f.id?'selected':''}" data-id="${f.id}" tabindex="0" draggable="${state.view==='all'}"><div class="file-name"><span class="file-icon ${f.type}">${icon(['folder','video','audio','image','text'].includes(f.type)?f.type:'file',21)}</span><span title="${esc(f.displayName||f.name)}">${esc(f.displayName||f.name)}</span>${!f.trashed?`<button class="favorite-toggle ${f.favorite?'active':''}" data-favorite="${f.id}" aria-label="${f.favorite?'Убрать из избранного':'Добавить в избранное'}: ${esc(f.displayName||f.name)}" title="${f.favorite?'Убрать из избранного':'Добавить в избранное'}">${icon('star',17)}</button>`:''}</div><span class="meta">${esc(f.date)}</span><span class="meta">${esc(f.displaySize)}</span>${f.trashChild?"":`<button class="more" data-more="${f.id}" aria-label="Действия с ${esc(f.displayName||f.name)}">•••</button>`}</div>`).join(''):`<div class="empty">${icon('folder',42)}<h3>${state.search?'Ничего не найдено':state.view==='trash'&&!state.trashBrowse?'Корзина пуста':state.view==='favorites'?'Пока нет избранных файлов и папок':'В этой папке пока пусто'}</h3><p>${state.search?'Попробуйте другой запрос':state.view==='favorites'?'Нажмите на звёздочку рядом с файлом или папкой, чтобы добавить сюда':'Файлы появятся здесь после добавления'}</p></div>`
   }
   async function load() {
     try {
@@ -194,14 +195,46 @@ function init(user) {
       return
     }
     if(f.directory){state.storage=f.storage;state.folder=f.path;state.view='all';state.search='';$('#search').value='';void load()}
-    else if(['video','audio','image','pdf'].includes(f.type))await preview(f)
+    else if(['video','audio','image','pdf','text'].includes(f.type))await preview(f)
     else await download(f)
   }
   async function preview(f) {
     try{await ensureFileId(f)}catch(error){showToast(error.message);return}
     const url=fileUrl(f)
-    const content=f.type==='video'?`<video controls autoplay src="${url}"></video>`:f.type==='audio'?`<audio controls autoplay src="${url}"></audio>`:f.type==='image'?`<img src="${url}" alt="${esc(f.name)}">`:`<iframe src="${url}" title="${esc(f.name)}"></iframe>`
+    const content=f.type==='text'?'<p class="preview-status" role="status">Загрузка текста…</p>':f.type==='video'?`<video controls autoplay src="${url}"></video>`:f.type==='audio'?`<audio controls autoplay src="${url}"></audio>`:f.type==='image'?`<img src="${url}" alt="${esc(f.name)}">`:`<iframe src="${url}" title="${esc(f.name)}"></iframe>`
     modal(f.name,`<div class="real-preview">${content}</div><div class="modal-footer"><a class="primary-button" href="${fileUrl(f,'download')}">Скачать</a></div>`)
+    $('#modal').classList.add('preview-modal')
+    const stage=$('#modal .real-preview')
+    if(f.type==='image')stage.querySelector('img').onerror=()=>{stage.innerHTML='<p class="preview-status" role="alert">Не удалось открыть изображение. Попробуйте скачать файл.</p>'}
+    if(f.type!=='text')return
+    const controller=new AbortController()
+    previewController=controller
+    const limit=1024*1024
+    try {
+      const response=await fetch(url,{signal:controller.signal,headers:{Range:`bytes=0-${limit-1}`}})
+      if(!response.ok)throw new Error('Не удалось загрузить текст. Попробуйте скачать файл.')
+      const reader=response.body.getReader(),decoder=new TextDecoder(),parts=[]
+      let received=0,truncated=false
+      try {
+        while(true) {
+          const {done,value}=await reader.read()
+          if(done)break
+          const chunk=value.subarray(0,limit-received)
+          parts.push(decoder.decode(chunk,{stream:true}));received+=chunk.length
+          if(received>=limit){truncated=true;await reader.cancel();break}
+        }
+      } finally {reader.releaseLock()}
+      if(!truncated)parts.push(decoder.decode())
+      if(controller.signal.aborted)return
+      const text=parts.join('')
+      if(text.includes('\u0000'))throw new Error('Не удалось прочитать файл как текст. Попробуйте скачать оригинал.')
+      stage.classList.add('text-preview')
+      stage.innerHTML='<pre tabindex="0" aria-label="Содержимое файла"></pre>'
+      stage.querySelector('pre').textContent=text||'Файл пуст'
+      if(truncated){const note=document.createElement('p');note.className='modal-note';note.textContent='Показан первый 1 МБ файла. Полный текст доступен при скачивании.';stage.after(note)}
+    } catch(error) {
+      if(!controller.signal.aborted){stage.innerHTML='<p class="preview-status" role="alert"></p>';stage.firstElementChild.textContent=error.message}
+    } finally {if(previewController===controller)previewController=null}
   }
   async function download(f) {
     try{await ensureFileId(f)}catch(error){showToast(error.message);return}
